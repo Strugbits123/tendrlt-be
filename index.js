@@ -9,7 +9,7 @@ const authRoutes = require('./routes/auth');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
-
+  const connectionString = process.env.DATABASE_URL;
 // Middlewares
 app.use(cors({
   origin: FRONTEND_URL,
@@ -34,7 +34,7 @@ app.get('/health', (req, res) => {
 
 // Root route
 app.get('/', (req, res) => {
-  res.send('TendrIt Backend API is running.');
+  res.send(`TendrIt Backend API is running. ${connectionString}`);
 });
 
 // Error handling middleware
