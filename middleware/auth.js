@@ -2,17 +2,16 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 
 /**
- * Protect routes: Authenticates request and sets req.user
+ * Protect routes: Authenticates request and sets req.user.
+ * Uses queryAsUser so the DB-level RLS policy is enforced —
+ * the session lookup runs as tendrit_app with app.current_user_id set.
  */
 async function authenticate(req, res, next) {
   let token = null;
 
-  // 1. Check cookies first (HttpOnly cookies for frontend)
   if (req.cookies && req.cookies.token) {
     token = req.cookies.token;
-  }
-  // 2. Fallback to Authorization Header
-  else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+  } else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
     token = req.headers.authorization.split(' ')[1];
   }
 
@@ -22,10 +21,12 @@ async function authenticate(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
-    
-    // Fetch the user from the DB to make sure they still exist
-    const userRes = await db.query(
-      'SELECT id, email, first_name, last_name, role, provider_service, avatar_url, is_email_verified FROM public.users WHERE id = $1', 
+
+    // queryAsUser enforces RLS: the SELECT only succeeds if the row's id
+    // matches app.current_user_id (set inside the transaction).
+    const userRes = await db.queryAsUser(
+      decoded.id,
+      'SELECT id, email, first_name, last_name, role, provider_service, avatar_url, is_email_verified, phone_number, parish FROM public.users WHERE id = $1',
       [decoded.id]
     );
 
