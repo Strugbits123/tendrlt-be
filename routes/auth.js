@@ -79,6 +79,50 @@ const sendVerificationEmail = async (email, token, firstName) => {
 };
 
 /**
+ * Helper to send password reset email via Resend
+ */
+const sendPasswordResetEmail = async (email, token, firstName) => {
+  const resetUrl = `${FRONTEND_URL}/forgot-password?token=${token}`;
+
+  await resend.emails.send({
+    from: `TendrIt <${process.env.RESEND_FROM_EMAIL}>`,
+    to: email,
+    subject: 'Reset your TendrIt password',
+    html: `
+      <!DOCTYPE html>
+      <html>
+        <body style="margin:0;padding:0;background:#f8f6f0;font-family:sans-serif;">
+          <div style="max-width:520px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid rgba(15,26,14,0.08);">
+            <div style="background:#0f1a0e;padding:28px 36px;">
+              <span style="font-size:22px;font-weight:900;color:#ffffff;letter-spacing:-0.02em;">
+                Tendr<span style="color:#7db885;">It</span>
+              </span>
+            </div>
+            <div style="padding:36px;">
+              <h1 style="margin:0 0 12px;font-size:22px;font-weight:800;color:#0f1a0e;">Hi ${firstName}, reset your password</h1>
+              <p style="margin:0 0 24px;font-size:15px;color:rgba(15,26,14,0.55);line-height:1.7;">
+                We received a request to reset the password for your TendrIt account. Click the button below to choose a new password.
+              </p>
+              <a href="${resetUrl}"
+                style="display:inline-block;background:#3d6b45;color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;padding:14px 32px;border-radius:100px;">
+                Reset My Password
+              </a>
+              <p style="margin:24px 0 0;font-size:13px;color:rgba(15,26,14,0.35);line-height:1.6;">
+                This link expires in <strong>1 hour</strong>. If you didn't request a password reset, you can safely ignore this email — your password won't change.
+              </p>
+              <div style="margin-top:24px;padding-top:20px;border-top:1px solid rgba(15,26,14,0.07);font-size:12px;color:rgba(15,26,14,0.3);">
+                Or paste this link in your browser:<br/>
+                <span style="word-break:break-all;">${resetUrl}</span>
+              </div>
+            </div>
+          </div>
+        </body>
+      </html>
+    `
+  });
+};
+
+/**
  * POST /api/auth/register
  * Register a user via email/password — sends verification email
  */
@@ -448,6 +492,92 @@ router.post('/complete-profile', authenticate, async (req, res) => {
   } catch (err) {
     console.error('Complete profile error:', err);
     return res.status(500).json({ success: false, message: 'Internal server error completing profile.' });
+  }
+});
+
+/**
+ * POST /api/auth/forgot-password
+ * Generate a reset token and email a reset link
+ */
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required.' });
+  }
+
+  try {
+    const result = await db.query(
+      'SELECT id, first_name, email FROM public.users WHERE email = $1',
+      [email.toLowerCase()]
+    );
+
+    // Always return the same response to prevent email enumeration
+    if (result.rows.length === 0) {
+      return res.json({ success: true, message: 'If this email is registered, a reset link has been sent.' });
+    }
+
+    const user = result.rows[0];
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await db.query(
+      'UPDATE public.users SET password_reset_token = $1, password_reset_expires_at = $2 WHERE id = $3',
+      [resetToken, resetExpires, user.id]
+    );
+
+    await sendPasswordResetEmail(user.email, resetToken, user.first_name);
+
+    return res.json({ success: true, message: 'If this email is registered, a reset link has been sent.' });
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+/**
+ * POST /api/auth/reset-password
+ * Validate token and update password
+ */
+router.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+
+  if (!token || !password) {
+    return res.status(400).json({ success: false, message: 'Token and password are required.' });
+  }
+
+  if (password.length < 8) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 8 characters.' });
+  }
+
+  try {
+    const result = await db.query(
+      'SELECT id, password_reset_expires_at FROM public.users WHERE password_reset_token = $1',
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired reset link.', expired: true });
+    }
+
+    const user = result.rows[0];
+
+    if (new Date() > new Date(user.password_reset_expires_at)) {
+      return res.status(400).json({ success: false, message: 'This reset link has expired. Please request a new one.', expired: true });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    await db.query(
+      'UPDATE public.users SET password_hash = $1, password_reset_token = NULL, password_reset_expires_at = NULL WHERE id = $2',
+      [passwordHash, user.id]
+    );
+
+    return res.json({ success: true, message: 'Password updated successfully. You can now sign in.' });
+  } catch (err) {
+    console.error('Reset password error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
   }
 });
 
