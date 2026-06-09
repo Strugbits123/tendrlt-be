@@ -15,13 +15,13 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-/**
- * Cookie options helper
- */
+// Treat as production if NODE_ENV is set, OR if the frontend URL is https (catches missing NODE_ENV in deployments)
+const isProduction = process.env.NODE_ENV === 'production' || FRONTEND_URL.startsWith('https://');
+
 const getCookieOptions = () => ({
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
   maxAge: 7 * 24 * 60 * 60 * 1000
 });
 
@@ -464,11 +464,8 @@ router.get('/me', authenticate, (req, res) => {
  * Log out and clear session cookie
  */
 router.post('/logout', (req, res) => {
-  res.clearCookie('token', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-  });
+  const { maxAge: _drop, ...clearOpts } = getCookieOptions();
+  res.clearCookie('token', clearOpts);
   return res.json({ success: true, message: 'Logged out successfully.' });
 });
 
