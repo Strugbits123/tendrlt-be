@@ -34,7 +34,7 @@ app.get('/health', (req, res) => {
 
 // Root route
 app.get('/', (req, res) => {
-  res.send(`TendrIt Backend API is running. ${connectionString}`);
+  res.send(`TendrIt Backend API is running.`);
 });
 
 // Error handling middleware
