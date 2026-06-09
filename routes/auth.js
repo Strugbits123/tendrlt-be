@@ -41,9 +41,7 @@ const sendVerificationEmail = async (email, token, firstName) => {
   const verificationUrl = `${BACKEND_URL}/api/auth/verify-email?token=${token}`;
 
   await resend.emails.send({
-    // NOTE: Replace 'onboarding@resend.dev' with your verified domain email (e.g. noreply@tendrit.com)
-    // until then Resend only allows sending to the email that owns the Resend account.
-    from: 'TendrIt <onboarding@resend.dev>',
+    from: `TendrIt <${process.env.RESEND_FROM_EMAIL}>`,
     to: email,
     subject: 'Verify your TendrIt account',
     html: `
