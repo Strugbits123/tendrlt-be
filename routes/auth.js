@@ -214,9 +214,11 @@ router.get('/verify-email', async (req, res) => {
 
     // Already verified — just log them in
     if (user.is_email_verified) {
-      setTokenCookie(res, user.id);
+      const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
       const redirectPath = user.role === 'provider' ? '/provider-browse' : '/dashboard';
-      return res.redirect(`${FRONTEND_URL}${redirectPath}`);
+      return res.redirect(
+        `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(token)}&next=${encodeURIComponent(redirectPath)}`
+      );
     }
 
     // Check token expiry
@@ -232,10 +234,11 @@ router.get('/verify-email', async (req, res) => {
       [user.id]
     );
 
-    setTokenCookie(res, user.id);
-
+    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
     const nameParam = encodeURIComponent(`${user.first_name} ${user.last_name}`);
-    return res.redirect(`${FRONTEND_URL}/verify?status=verified&role=${user.role}&name=${nameParam}`);
+    return res.redirect(
+      `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(token)}&next=%2Fverify&status=verified&role=${user.role}&name=${nameParam}`
+    );
   } catch (err) {
     console.error('Email verification error:', err);
     return res.redirect(`${FRONTEND_URL}/verify?status=error`);
@@ -440,16 +443,26 @@ router.get('/google/callback', async (req, res) => {
       }
     }
 
-    setTokenCookie(res, user.id);
+    // Generate JWT without setting it as a backend cookie.
+    // In production the backend and frontend are on different domains, so a
+    // cookie set here would be scoped to the API domain and invisible to the
+    // Next.js middleware on the frontend domain.  Instead we pass the token
+    // through the frontend /api/auth/callback handler which sets the cookie
+    // on the correct domain.
+    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
     const isProfileIncomplete = !user.phone_number || !user.parish;
 
     if (isProfileIncomplete || isNewUser) {
       const nameParam = encodeURIComponent(`${user.first_name} ${user.last_name}`);
-      return res.redirect(`${FRONTEND_URL}/complete-profile?role=${user.role}&name=${nameParam}`);
+      return res.redirect(
+        `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(token)}&next=%2Fcomplete-profile&role=${user.role}&name=${nameParam}`
+      );
     } else {
       const redirectPath = user.role === 'provider' ? '/provider-browse' : '/dashboard';
-      return res.redirect(`${FRONTEND_URL}${redirectPath}`);
+      return res.redirect(
+        `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(token)}&next=${encodeURIComponent(redirectPath)}`
+      );
     }
   } catch (err) {
     console.error('Google OAuth callback error:', err.response?.data || err.message);
