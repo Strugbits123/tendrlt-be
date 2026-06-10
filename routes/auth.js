@@ -154,6 +154,10 @@ router.post('/register', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid user role selected.' });
   }
 
+  if (role === 'provider' && !provider_service) {
+    return res.status(400).json({ success: false, message: 'Please select your primary service category.' });
+  }
+
   try {
     const userExist = await db.query('SELECT id FROM public.users WHERE email = $1', [email.toLowerCase()]);
     if (userExist.rows.length > 0) {
