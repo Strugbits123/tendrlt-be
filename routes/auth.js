@@ -18,11 +18,27 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 // Treat as production if NODE_ENV is set, OR if the frontend URL is https (catches missing NODE_ENV in deployments)
 const isProduction = process.env.NODE_ENV === 'production' || FRONTEND_URL.startsWith('https://');
 
+// Derive ".tendrit.com" from FRONTEND_URL so the cookie is visible on all
+// subdomains (frontend middleware on staging.tendrit.com AND API calls back
+// to api.tendrit.com).  Falls back to undefined (host-only) for localhost.
+const getCookieDomain = () => {
+  if (!isProduction) return undefined;
+  try {
+    const hostname = new URL(FRONTEND_URL).hostname;
+    const parts = hostname.split('.');
+    return parts.length >= 2 ? '.' + parts.slice(-2).join('.') : undefined;
+  } catch (_) {
+    return undefined;
+  }
+};
+const COOKIE_DOMAIN = getCookieDomain();
+
 const getCookieOptions = () => ({
   httpOnly: true,
   secure: isProduction,
   sameSite: isProduction ? 'none' : 'lax',
-  maxAge: 7 * 24 * 60 * 60 * 1000
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+  ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {})
 });
 
 /**
