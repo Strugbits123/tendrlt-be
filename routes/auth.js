@@ -210,16 +210,16 @@ router.post('/register', async (req, res) => {
  * Validates token, marks email verified, sets session cookie, redirects to frontend
  */
 router.get('/verify-email', async (req, res) => {
-  const { token } = req.query;
+  const verifyToken = req.query.token;
 
-  if (!token) {
+  if (!verifyToken) {
     return res.redirect(`${FRONTEND_URL}/verify?status=error`);
   }
 
   try {
     const result = await db.query(
       'SELECT * FROM public.users WHERE email_verification_token = $1',
-      [token]
+      [verifyToken]
     );
 
     if (result.rows.length === 0) {
@@ -230,10 +230,10 @@ router.get('/verify-email', async (req, res) => {
 
     // Already verified — just log them in
     if (user.is_email_verified) {
-      const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+      const authToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
       const redirectPath = user.role === 'provider' ? '/provider-browse' : '/dashboard';
       return res.redirect(
-        `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(token)}&next=${encodeURIComponent(redirectPath)}`
+        `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(authToken)}&next=${encodeURIComponent(redirectPath)}`
       );
     }
 
@@ -250,10 +250,10 @@ router.get('/verify-email', async (req, res) => {
       [user.id]
     );
 
-    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const authToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
     const nameParam = encodeURIComponent(`${user.first_name} ${user.last_name}`);
     return res.redirect(
-      `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(token)}&next=%2Fverify&status=verified&role=${user.role}&name=${nameParam}`
+      `${FRONTEND_URL}/api/auth/callback?token=${encodeURIComponent(authToken)}&next=%2Fverify&status=verified&role=${user.role}&name=${nameParam}`
     );
   } catch (err) {
     console.error('Email verification error:', err);
