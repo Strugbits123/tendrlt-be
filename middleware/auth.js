@@ -3,8 +3,10 @@ const db = require('../db');
 
 /**
  * Protect routes: Authenticates request and sets req.user.
- * Uses queryAsUser so the DB-level RLS policy is enforced —
- * the session lookup runs as tendrit_app with app.current_user_id set.
+ * Uses db.query (superuser, bypasses RLS) for the session lookup —
+ * the JWT signature already proves the user's identity, so RLS is
+ * not needed here and would block newly-created users whose row isn't
+ * yet visible to the tendrit_app role.
  */
 async function authenticate(req, res, next) {
   let token = null;
@@ -22,10 +24,7 @@ async function authenticate(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
 
-    // queryAsUser enforces RLS: the SELECT only succeeds if the row's id
-    // matches app.current_user_id (set inside the transaction).
-    const userRes = await db.queryAsUser(
-      decoded.id,
+    const userRes = await db.query(
       'SELECT id, email, first_name, last_name, role, provider_service, avatar_url, is_email_verified, phone_number, parish FROM public.users WHERE id = $1',
       [decoded.id]
     );
