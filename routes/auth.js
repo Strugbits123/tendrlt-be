@@ -189,6 +189,24 @@ router.post('/register', async (req, res) => {
 
     const user = result.rows[0];
 
+    // Seed the provider's first service into provider_services so the
+    // onboarding page can pre-fill step 2 from the DB on first load.
+    if (role === 'provider' && provider_service) {
+      try {
+        await db.query(
+          `INSERT INTO public.provider_services (provider_id, category, service_type_id)
+           SELECT $1::uuid, st.slug::service_category, st.id
+           FROM public.service_types st
+           WHERE st.slug = $2
+           ON CONFLICT (provider_id, category) DO NOTHING`,
+          [user.id, provider_service]
+        );
+      } catch (seedErr) {
+        // Non-fatal — user is created; they can set services from the onboarding page
+        console.warn('provider_services seed on register failed:', seedErr.message);
+      }
+    }
+
     // Send verification email
     await sendVerificationEmail(email.toLowerCase(), verificationToken, first_name);
 
@@ -517,7 +535,25 @@ router.post('/complete-profile', authenticate, async (req, res) => {
       req.user.id
     ]);
 
-    return res.json({ success: true, message: 'Profile completed successfully.', user: result.rows[0] });
+    const updatedUser = result.rows[0];
+
+    // Seed the provider's first service into provider_services (same as register path)
+    if (role === 'provider' && provider_service) {
+      try {
+        await db.query(
+          `INSERT INTO public.provider_services (provider_id, category, service_type_id)
+           SELECT $1::uuid, st.slug::service_category, st.id
+           FROM public.service_types st
+           WHERE st.slug = $2
+           ON CONFLICT (provider_id, category) DO NOTHING`,
+          [req.user.id, provider_service]
+        );
+      } catch (seedErr) {
+        console.warn('provider_services seed on complete-profile failed:', seedErr.message);
+      }
+    }
+
+    return res.json({ success: true, message: 'Profile completed successfully.', user: updatedUser });
   } catch (err) {
     console.error('Complete profile error:', err);
     return res.status(500).json({ success: false, message: 'Internal server error completing profile.' });

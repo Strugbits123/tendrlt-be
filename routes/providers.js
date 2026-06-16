@@ -39,15 +39,17 @@ router.get('/me', authenticate, authorize('provider'), async (req, res) => {
   try {
     // Single query + single transaction instead of 3 separate queryAsUser calls.
     // Before: 3 × 5 = 15 DB round trips.  After: 3 round trips total.
+    // Wrap array_agg results in json_agg so pg parses them as JS arrays,
+    // not raw PostgreSQL array strings (which happens inside scalar subqueries).
     const result = await db.queryAsUser(req.user.id, `
       SELECT
         (SELECT to_json(p.*) FROM public.provider_profiles p WHERE p.provider_id = $1) AS profile,
         (
-          SELECT COALESCE(array_agg(s.category ORDER BY s.created_at), ARRAY[]::service_category[])
+          SELECT COALESCE(json_agg(s.category::text ORDER BY s.created_at), '[]'::json)
           FROM public.provider_services s WHERE s.provider_id = $1
         ) AS services,
         (
-          SELECT COALESCE(array_agg(pa.parish ORDER BY pa.created_at), ARRAY[]::text[])
+          SELECT COALESCE(json_agg(pa.parish ORDER BY pa.created_at), '[]'::json)
           FROM public.provider_parishes pa WHERE pa.provider_id = $1
         ) AS parishes
     `, [req.user.id]);
@@ -158,8 +160,11 @@ router.put('/services', authenticate, authorize('provider'), async (req, res) =>
         params: [req.user.id],
       },
       {
-        text: `INSERT INTO public.provider_services (provider_id, category)
-               SELECT $1, cat FROM (SELECT DISTINCT UNNEST($2::service_category[]) AS cat) t`,
+        // categories are TEXT slugs from the frontend; cast to enum + join for service_type_id
+        text: `INSERT INTO public.provider_services (provider_id, category, service_type_id)
+               SELECT $1, cat::service_category, st.id
+               FROM (SELECT DISTINCT UNNEST($2::text[]) AS cat) t
+               JOIN public.service_types st ON st.slug = t.cat`,
         params: [req.user.id, categories],
       },
       {
