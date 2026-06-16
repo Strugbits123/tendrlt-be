@@ -11,7 +11,14 @@ const pool = new Pool({
   connectionString,
   ssl: connectionString && connectionString.includes('supabase.co')
     ? { rejectUnauthorized: false }
-    : false
+    : false,
+  max: 10,                    // stay under Supabase free-tier connection limit (25)
+  idleTimeoutMillis: 30000,   // keep idle connections alive 30s
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => {
+  console.error('Idle pool client error:', err.message);
 });
 
 /**
@@ -22,9 +29,12 @@ const query = (text, params) => pool.query(text, params);
 
 /**
  * User-scoped query — enforces RLS.
- * Runs inside a transaction as the tendrit_app role with
- * app.current_user_id set to the authenticated user's UUID.
- * Use for all protected operations after authentication.
+ *
+ * Previously: 5 round trips (BEGIN + SET ROLE + SET USER + query + COMMIT).
+ * Now:        3 round trips (BEGIN+SET+SET combined in one simple query + query + COMMIT).
+ *
+ * The three setup statements are sent as a single simple-protocol message so
+ * Postgres processes them in one server round trip.
  *
  * @param {string} userId  - The authenticated user's UUID (req.user.id)
  * @param {string} text    - SQL query string
@@ -33,9 +43,10 @@ const query = (text, params) => pool.query(text, params);
 const queryAsUser = async (userId, text, params) => {
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    await client.query('SET LOCAL ROLE tendrit_app');
-    await client.query(`SET LOCAL app.current_user_id = '${userId}'`);
+    // One round trip: BEGIN + both SET LOCAL in a single simple query
+    await client.query(
+      `BEGIN; SET LOCAL ROLE tendrit_app; SET LOCAL "app.current_user_id" = '${userId}'`
+    );
     const result = await client.query(text, params);
     await client.query('COMMIT');
     return result;
@@ -47,4 +58,33 @@ const queryAsUser = async (userId, text, params) => {
   }
 };
 
-module.exports = { query, queryAsUser, pool };
+/**
+ * Run multiple SQL statements inside a single user-scoped transaction.
+ * Use instead of calling queryAsUser() N times when you need N queries
+ * for the same user — saves (N-1) × 3 round trips.
+ *
+ * @param {string} userId
+ * @param {Array<{text: string, params?: Array}>} queries
+ * @returns {Promise<Array>}  one result object per query, in order
+ */
+const queryAsUserBatch = async (userId, queries) => {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `BEGIN; SET LOCAL ROLE tendrit_app; SET LOCAL "app.current_user_id" = '${userId}'`
+    );
+    const results = [];
+    for (const { text, params } of queries) {
+      results.push(await client.query(text, params || []));
+    }
+    await client.query('COMMIT');
+    return results;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = { query, queryAsUser, queryAsUserBatch, pool };

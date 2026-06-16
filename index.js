@@ -5,6 +5,7 @@ const path = require('path');
 require('dotenv').config();
 
 const authRoutes = require('./routes/auth');
+const providersRoutes = require('./routes/providers');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -26,6 +27,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Mount routes
 app.use('/api/auth', authRoutes);
+app.use('/api/providers', providersRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
