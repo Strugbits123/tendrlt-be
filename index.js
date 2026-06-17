@@ -7,6 +7,7 @@ require('dotenv').config();
 const authRoutes     = require('./routes/auth');
 const providersRoutes = require('./routes/providers');
 const servicesRoutes  = require('./routes/services');
+const tendersRoutes   = require('./routes/tenders');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -16,7 +17,7 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 app.use(cors({
   origin: FRONTEND_URL,
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
@@ -30,6 +31,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use('/api/auth',      authRoutes);
 app.use('/api/providers', providersRoutes);
 app.use('/api/services',  servicesRoutes);
+app.use('/api/tenders',   tendersRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

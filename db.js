@@ -12,9 +12,9 @@ const pool = new Pool({
   ssl: connectionString && connectionString.includes('supabase.co')
     ? { rejectUnauthorized: false }
     : false,
-  max: 10,                    // stay under Supabase free-tier connection limit (25)
-  idleTimeoutMillis: 30000,   // keep idle connections alive 30s
-  connectionTimeoutMillis: 5000,
+  max: 10,                     // stay under Supabase free-tier connection limit (25)
+  idleTimeoutMillis: 30000,    // keep idle connections alive 30s
+  connectionTimeoutMillis: 10000, // 10s — Supabase free tier can be slow on cold starts
 });
 
 pool.on('error', (err) => {
