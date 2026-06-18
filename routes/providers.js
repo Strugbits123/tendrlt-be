@@ -4,6 +4,8 @@ const multer = require('multer');
 const db = require('../db');
 const supabase = require('../lib/supabaseClient');
 const { authenticate, authorize } = require('../middleware/auth');
+const { notifyChannel } = require('../lib/realtimeService');
+const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
 
 const router = express.Router();
 
@@ -382,6 +384,41 @@ router.post('/go-live', authenticate, authorize('provider'), async (req, res) =>
     }
 
     res.json({ success: true });
+
+    // Fire-and-forget: email all admins + broadcast Realtime.
+    // Both run AFTER the response is already sent so they never delay the provider.
+    try {
+      const [providerRes, adminRes] = await Promise.all([
+        db.query(
+          `SELECT u.first_name, u.last_name,
+                  (SELECT st.display_name
+                     FROM public.provider_services ps
+                     JOIN public.service_types st ON st.slug = ps.category::text
+                    WHERE ps.provider_id = $1
+                    LIMIT 1) AS service_name
+             FROM public.users u
+            WHERE u.id = $1`,
+          [req.user.id]
+        ),
+        db.query(
+          `SELECT email FROM public.users WHERE role = 'admin' AND is_email_verified = TRUE`
+        ),
+      ]);
+
+      const p = providerRes.rows[0];
+      const providerName = p ? `${p.first_name} ${p.last_name}`.trim() : 'A provider';
+      const adminEmails = adminRes.rows.map((r) => r.email);
+
+      await Promise.allSettled([
+        sendNewProviderSubmittedEmail(providerName, p?.service_name || null, adminEmails),
+        notifyChannel('admin-verifications', 'new-verification', {
+          providerId: req.user.id,
+          providerName,
+        }),
+      ]);
+    } catch (notifyErr) {
+      console.warn('POST /api/providers/go-live — admin notification failed:', notifyErr.message);
+    }
   } catch (err) {
     console.error('POST /api/providers/go-live error:', err);
     res.status(500).json({ success: false, message: 'Failed to go live. Please try again.' });

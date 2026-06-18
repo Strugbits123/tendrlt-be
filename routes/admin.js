@@ -7,6 +7,7 @@ const {
   sendProviderApprovedEmail,
   sendProviderRejectedEmail,
 } = require('../lib/verificationEmails');
+const { notifyUser } = require('../lib/realtimeService');
 
 const router = express.Router();
 
@@ -115,6 +116,36 @@ router.get('/verifications', async (req, res) => {
 });
 
 // ============================================================
+// GET /api/admin/verifications/unread-count?since=<unix_ms>
+// Returns count of pending verifications submitted after the given timestamp.
+// Used by the sidebar badge to show how many are new since the admin last
+// viewed the verification page. `since` is milliseconds since epoch (from
+// localStorage). Defaults to 0 (count all pending) if omitted or invalid.
+// IMPORTANT: must be declared before /:providerId routes to avoid that param
+// matching the literal string "unread-count".
+// ============================================================
+router.get('/verifications/unread-count', async (req, res) => {
+  try {
+    const sinceMs = parseInt(req.query.since, 10);
+    const since = !isNaN(sinceMs) && sinceMs > 0 ? new Date(sinceMs) : new Date(0);
+
+    const result = await db.query(
+      `SELECT COUNT(*)::int AS count
+         FROM public.provider_profiles pp
+        WHERE pp.is_onboarding_complete = TRUE
+          AND pp.verification_status    = 'pending'
+          AND COALESCE(pp.resubmitted_at, pp.submitted_at) > $1`,
+      [since]
+    );
+
+    res.json({ success: true, count: result.rows[0].count });
+  } catch (err) {
+    console.error('GET /api/admin/verifications/unread-count error:', err);
+    res.status(500).json({ success: false, count: 0 });
+  }
+});
+
+// ============================================================
 // GET /api/admin/verifications/:providerId/document/:docType
 // Generate a short-lived signed URL for a private provider document.
 // ============================================================
@@ -196,6 +227,10 @@ router.post('/verifications/:providerId/approve', async (req, res) => {
       }
     }
 
+    await notifyUser(providerId, 'verification-approved', {
+      message: 'Your account has been approved! You can now receive jobs.',
+    });
+
     res.json({ success: true, verification_status: 'approved' });
   } catch (err) {
     console.error('POST approve error:', err);
@@ -255,6 +290,11 @@ router.post('/verifications/:providerId/reject', async (req, res) => {
         console.warn('Rejection email failed:', mailErr.message);
       }
     }
+
+    await notifyUser(providerId, 'verification-rejected', {
+      message: 'Your verification was not approved. Check your email for details.',
+      reason,
+    });
 
     res.json({ success: true, verification_status: 'rejected' });
   } catch (err) {
