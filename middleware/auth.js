@@ -21,9 +21,16 @@ async function authenticate(req, res, next) {
     return res.status(401).json({ success: false, message: 'Access denied. No session token provided.' });
   }
 
+  // Step 1: verify the JWT signature — pure CPU, no DB involved
+  let decoded;
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+    decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+  } catch (jwtErr) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired session token.' });
+  }
 
+  // Step 2: look up the user row — may fail due to DB connectivity
+  try {
     const userRes = await db.query(
       'SELECT id, email, first_name, last_name, role, provider_service, avatar_url, is_email_verified, phone_number, parish FROM public.users WHERE id = $1',
       [decoded.id]
@@ -35,9 +42,11 @@ async function authenticate(req, res, next) {
 
     req.user = userRes.rows[0];
     next();
-  } catch (err) {
-    console.error('Authentication JWT error:', err.message);
-    return res.status(401).json({ success: false, message: 'Invalid or expired session token.' });
+  } catch (dbErr) {
+    // DB connection timeout or infrastructure error — NOT an auth failure.
+    // Return 503 so the frontend knows to retry rather than log the user out.
+    console.error('Authentication DB error:', dbErr.message);
+    return res.status(503).json({ success: false, message: 'Service temporarily unavailable. Please try again.' });
   }
 }
 
