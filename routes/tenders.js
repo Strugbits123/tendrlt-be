@@ -150,6 +150,32 @@ router.patch('/:id',
     const { id } = req.params;
     const { status } = req.body;
 
+    // ── Quote guard ──────────────────────────────────────────────
+    // An already-published (open) tender can only be edited while it has NO
+    // quotes. Once a provider has quoted, the brief is locked. Drafts and the
+    // draft→open publish step are unaffected (a draft has no quotes yet).
+    try {
+      const guard = await db.queryAsUserBatch(req.user.id, [
+        { text: `SELECT status FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
+        { text: `SELECT COUNT(*)::int AS n FROM public.quotes WHERE tender_id = $1`, params: [id] },
+      ]);
+      if (guard[0].rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Tender not found.' });
+      }
+      const currentStatus = guard[0].rows[0].status;
+      const quoteCount = guard[1].rows[0].n;
+      if (currentStatus === 'open' && quoteCount > 0) {
+        return res.status(409).json({
+          success: false,
+          code: 'TENDER_HAS_QUOTES',
+          message: 'This tender already has quotes and can no longer be edited.',
+        });
+      }
+    } catch (guardErr) {
+      console.error('PATCH /api/tenders/:id quote-guard error:', guardErr);
+      return res.status(500).json({ success: false, message: 'Failed to update tender.' });
+    }
+
     // Full validation when upgrading to open
     if (status === 'open') {
       const { category, parish, urgency, contact_name, contact_phone } = req.body;
@@ -314,7 +340,11 @@ router.get('/:id', authenticate, authorize('homeowner'), async (req, res) => {
     const [tenderResult, photosResult] = await db.queryAsUserBatch(req.user.id, [
       {
         text: `
-          SELECT t.*, st.display_name AS service_name, st.emoji AS service_emoji
+          SELECT
+            t.*,
+            st.display_name AS service_name,
+            st.emoji        AS service_emoji,
+            (SELECT COUNT(*)::int FROM public.quotes q WHERE q.tender_id = t.id) AS quote_count
           FROM public.tenders t
           LEFT JOIN public.service_types st ON st.id = t.service_type_id
           WHERE t.id = $1 AND t.client_id = $2
