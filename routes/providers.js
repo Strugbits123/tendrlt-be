@@ -1,8 +1,8 @@
 const express = require('express');
 const path = require('path');
 const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
 const db = require('../db');
+const supabase = require('../lib/supabaseClient');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
@@ -12,12 +12,6 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 104857600 }, // 100 MB max
 });
-
-// Supabase Storage client using service role key (bypasses storage RLS)
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
 
 // Map onboarding docType keys → Supabase bucket + Storage path prefix
 const BUCKETS = {
@@ -359,9 +353,21 @@ router.delete('/upload/portfolio', authenticate, authorize('provider'), async (r
 // ============================================================
 router.post('/go-live', authenticate, authorize('provider'), async (req, res) => {
   try {
+    // On (re)submission: mark onboarding complete and stamp submitted_at.
+    // If the provider was previously REJECTED, flip them back to 'pending' and
+    // stamp resubmitted_at so the application re-enters the admin queue.
+    // The previous rejection_reason/notes are intentionally preserved so the
+    // admin can see why it was rejected before. An approved provider re-saving
+    // is never downgraded.
     const result = await db.queryAsUser(req.user.id,
       `UPDATE public.provider_profiles
          SET is_onboarding_complete = TRUE,
+             submitted_at           = COALESCE(submitted_at, NOW()),
+             resubmitted_at         = CASE WHEN verification_status = 'rejected'
+                                           THEN NOW() ELSE resubmitted_at END,
+             verification_status    = CASE WHEN verification_status = 'rejected'
+                                           THEN 'pending'::public.verification_status
+                                           ELSE verification_status END,
              updated_at             = NOW()
        WHERE provider_id = $1
        RETURNING id`,
