@@ -355,6 +355,19 @@ router.delete('/upload/portfolio', authenticate, authorize('provider'), async (r
 // ============================================================
 router.post('/go-live', authenticate, authorize('provider'), async (req, res) => {
   try {
+    // Block re-submission for already-approved providers.
+    const statusRow = await db.queryAsUser(req.user.id,
+      `SELECT verification_status FROM public.provider_profiles WHERE provider_id = $1`,
+      [req.user.id]
+    );
+    if (statusRow.rows[0]?.verification_status === 'approved') {
+      return res.status(400).json({
+        success: false,
+        code: 'ALREADY_APPROVED',
+        message: 'Your account is already verified. No resubmission is needed.',
+      });
+    }
+
     // On (re)submission: mark onboarding complete and stamp submitted_at.
     // If the provider was previously REJECTED, flip them back to 'pending' and
     // stamp resubmitted_at so the application re-enters the admin queue.

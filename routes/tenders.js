@@ -4,6 +4,7 @@ const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
+const { notifyUser } = require('../lib/realtimeService');
 
 const router = express.Router();
 
@@ -130,6 +131,8 @@ router.post('/',
       }
 
       res.status(201).json({ success: true, tender, newPhotos });
+      // Fire-and-forget — notify the user's client so My Tenders refetches.
+      notifyUser(req.user.id, 'tenders-updated', { tenderId: tender.id }).catch(() => {});
     } catch (err) {
       console.error('POST /api/tenders error:', err);
       res.status(500).json({ success: false, message: 'Failed to create tender.' });
@@ -297,6 +300,8 @@ router.patch('/:id',
       }
 
       res.json({ success: true, tender, newPhotos });
+      // Fire-and-forget — notify the user's client so My Tenders refetches.
+      notifyUser(req.user.id, 'tenders-updated', { tenderId: id }).catch(() => {});
     } catch (err) {
       console.error('PATCH /api/tenders/:id error:', err);
       res.status(500).json({ success: false, message: 'Failed to update tender.' });
@@ -306,21 +311,47 @@ router.patch('/:id',
 
 // ============================================================
 // GET /api/tenders/mine
-// Lists all tenders for the current homeowner, newest first.
+// Lists tenders for the current homeowner, newest first.
+// Optional query params: ?status=open, ?limit=3
 // JOINs service_types for display_name + emoji.
 // ============================================================
 router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
+  const { status, limit } = req.query;
+  const params = [req.user.id];
+  let extraWhere = '';
+  let limitClause = '';
+
+  if (status) {
+    params.push(status);
+    extraWhere = ` AND t.status = $${params.length}::tender_status`;
+  }
+
+  if (limit) {
+    const n = parseInt(limit, 10);
+    if (!isNaN(n) && n > 0 && n <= 100) {
+      params.push(n);
+      limitClause = `LIMIT $${params.length}`;
+    }
+  }
+
   try {
     const result = await db.queryAsUser(req.user.id, `
       SELECT
-        t.*,
+        t.id, t.status, t.category, t.parish, t.description,
+        t.urgency, t.budget_min, t.budget_max, t.created_at,
+        t.quotes_count, t.best_quote_price, t.photos_count,
+        EXISTS (
+          SELECT 1 FROM public.quotes q
+          WHERE q.tender_id = t.id AND q.status = 'accepted'
+        ) AS has_accepted_quote,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
       FROM public.tenders t
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
-      WHERE t.client_id = $1
+      WHERE t.client_id = $1${extraWhere}
       ORDER BY t.created_at DESC
-    `, [req.user.id]);
+      ${limitClause}
+    `, params);
 
     res.json({ success: true, tenders: result.rows });
   } catch (err) {
@@ -439,21 +470,41 @@ router.delete('/:tenderId/photos/:photoId', authenticate, authorize('homeowner')
 
 // ============================================================
 // DELETE /api/tenders/:id
-// Deletes a draft or open tender owned by the current homeowner.
+// Deletes any tender owned by the current homeowner, provided no
+// quote has been accepted for it (accepted quotes lock the tender).
 // ============================================================
 router.delete('/:id', authenticate, authorize('homeowner'), async (req, res) => {
+  const { id } = req.params;
   try {
+    // Guard: reject deletion if a quote has been accepted.
+    const acceptedCheck = await db.queryAsUser(req.user.id, `
+      SELECT EXISTS (
+        SELECT 1 FROM public.quotes q
+        WHERE q.tender_id = $1 AND q.status = 'accepted'
+      ) AS has_accepted
+    `, [id]);
+
+    if (acceptedCheck.rows[0].has_accepted) {
+      return res.status(409).json({
+        success: false,
+        code: 'QUOTE_ACCEPTED',
+        message: 'This tender cannot be deleted because a quote has already been accepted.',
+      });
+    }
+
     const result = await db.queryAsUser(req.user.id, `
       DELETE FROM public.tenders
       WHERE id = $1 AND client_id = $2
       RETURNING id
-    `, [req.params.id, req.user.id]);
+    `, [id, req.user.id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Tender not found or cannot be deleted.' });
     }
 
     res.json({ success: true });
+    // Notify the user's connected clients so the dashboard and My Tenders refetch.
+    notifyUser(req.user.id, 'tenders-updated', { tenderId: id }).catch(() => {});
   } catch (err) {
     console.error('DELETE /api/tenders/:id error:', err);
     res.status(500).json({ success: false, message: 'Failed to delete tender.' });
