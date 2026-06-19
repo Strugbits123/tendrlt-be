@@ -339,7 +339,11 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
       SELECT
         t.id, t.status, t.category, t.parish, t.description,
         t.urgency, t.budget_min, t.budget_max, t.created_at,
-        t.quotes_count, t.best_quote_price, t.photos_count,
+        t.quotes_count, t.photos_count,
+        (
+          SELECT MIN(q.amount) FROM public.quotes q
+          WHERE q.tender_id = t.id
+        ) AS best_quote_price,
         EXISTS (
           SELECT 1 FROM public.quotes q
           WHERE q.tender_id = t.id AND q.status = 'accepted'
