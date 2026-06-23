@@ -4,7 +4,7 @@ const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
-const { notifyUser } = require('../lib/realtimeService');
+const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 
 const router = express.Router();
 
@@ -131,8 +131,14 @@ router.post('/',
       }
 
       res.status(201).json({ success: true, tender, newPhotos });
-      // Fire-and-forget — notify the user's client so My Tenders refetches.
+      // Fire-and-forget side effects
       notifyUser(req.user.id, 'tenders-updated', { tenderId: tender.id }).catch(() => {});
+      // Broadcast to all providers browsing — new tender available
+      notifyChannel('tenders-feed', 'tender-added', {
+        tenderId: tender.id,
+        category: tender.category,
+        parish:   tender.parish,
+      }).catch(() => {});
     } catch (err) {
       console.error('POST /api/tenders error:', err);
       res.status(500).json({ success: false, message: 'Failed to create tender.' });
@@ -361,6 +367,187 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
   } catch (err) {
     console.error('GET /api/tenders/mine error:', err);
     res.status(500).json({ success: false, message: 'Failed to load tenders.' });
+  }
+});
+
+// ============================================================
+// GET /api/tenders/browse
+// Provider-facing: lists all open tenders with filters.
+// Query params: category, parish, budgetMin, budgetMax, sort, search
+// Never exposes location_lat/lng or contact fields.
+// IMPORTANT: must be defined before GET /:id to avoid being swallowed
+// by the homeowner-only wildcard route.
+// ============================================================
+router.get('/browse', authenticate, authorize('provider'), async (req, res) => {
+  const { category, parish, budgetMin, budgetMax, sort, search } = req.query;
+  const params = [req.user.id];
+  const conditions = ["t.status = 'open'"];
+  let paramIdx = 2;
+
+  if (category) {
+    conditions.push(`t.category = $${paramIdx}::service_category`);
+    params.push(category);
+    paramIdx++;
+  }
+
+  if (parish) {
+    conditions.push(`t.parish = $${paramIdx}`);
+    params.push(parish);
+    paramIdx++;
+  }
+
+  if (budgetMin) {
+    const minCents = Math.round(parseFloat(budgetMin) * 100);
+    if (!isNaN(minCents)) {
+      conditions.push(`t.budget_max >= $${paramIdx}`);
+      params.push(minCents);
+      paramIdx++;
+    }
+  }
+
+  if (budgetMax) {
+    const maxCents = Math.round(parseFloat(budgetMax) * 100);
+    if (!isNaN(maxCents)) {
+      conditions.push(`t.budget_min <= $${paramIdx}`);
+      params.push(maxCents);
+      paramIdx++;
+    }
+  }
+
+  if (search) {
+    conditions.push(`(t.description ILIKE $${paramIdx} OR st.display_name ILIKE $${paramIdx} OR t.parish ILIKE $${paramIdx})`);
+    params.push(`%${search}%`);
+    paramIdx++;
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  let orderClause = 'ORDER BY t.created_at DESC';
+  if (sort === 'budget_high') {
+    orderClause = 'ORDER BY t.budget_max DESC NULLS LAST, t.created_at DESC';
+  } else if (sort === 'nearby') {
+    orderClause = `ORDER BY (
+      EXISTS (SELECT 1 FROM public.provider_parishes pp WHERE pp.provider_id = $1 AND pp.parish = t.parish)
+    ) DESC, t.created_at DESC`;
+  }
+
+  try {
+    const result = await db.queryAsUser(req.user.id, `
+      SELECT
+        t.id, t.category, t.parish, t.description, t.urgency,
+        t.budget_min, t.budget_max, t.created_at, t.quotes_count,
+        t.photos_count, t.preferred_start_date,
+        EXISTS (
+          SELECT 1 FROM public.quotes q
+          WHERE q.tender_id = t.id AND q.provider_id = $1
+        ) AS has_quoted,
+        st.display_name AS service_name,
+        st.emoji        AS service_emoji
+      FROM public.tenders t
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      ${whereClause}
+      ${orderClause}
+      LIMIT 100
+    `, params);
+
+    res.json({ success: true, tenders: result.rows });
+  } catch (err) {
+    console.error('GET /api/tenders/browse error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load tenders.' });
+  }
+});
+
+// ============================================================
+// GET /api/tenders/browse/:id
+// Provider-facing: single open tender detail.
+// Location + contact ONLY revealed if this provider's quote is accepted.
+// ============================================================
+router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [tenderResult, photosResult] = await db.queryAsUserBatch(req.user.id, [
+      {
+        text: `
+          SELECT
+            t.id, t.category, t.parish, t.description, t.urgency, t.urgency_note,
+            t.budget_min, t.budget_max, t.created_at, t.quotes_count,
+            t.photos_count, t.preferred_start_date, t.status,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
+            ) THEN t.location_lat  ELSE NULL END AS location_lat,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
+            ) THEN t.location_lng  ELSE NULL END AS location_lng,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
+            ) THEN t.contact_name  ELSE NULL END AS contact_name,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
+            ) THEN t.contact_phone ELSE NULL END AS contact_phone,
+            EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2
+            ) AS has_quoted,
+            (
+              SELECT row_to_json(q_row)
+              FROM (
+                SELECT id, amount, timeline, preferred_start_date, message, what_is_included, status, created_at
+                FROM public.quotes q
+                WHERE q.tender_id = t.id AND q.provider_id = $2
+                LIMIT 1
+              ) q_row
+            ) AS my_quote,
+            (
+              SELECT first_name || ' ' || LEFT(last_name, 1) || '.'
+              FROM public.users WHERE id = t.client_id
+            ) AS client_display_name,
+            (
+              SELECT COUNT(*)::int FROM public.tenders
+              WHERE client_id = t.client_id AND status IN ('open', 'in_progress', 'completed')
+            ) AS client_jobs_posted,
+            st.display_name AS service_name,
+            st.emoji        AS service_emoji
+          FROM public.tenders t
+          LEFT JOIN public.service_types st ON st.id = t.service_type_id
+          WHERE t.id = $1 AND t.status = 'open'
+        `,
+        params: [id, req.user.id],
+      },
+      {
+        text: `
+          SELECT id, storage_path, display_order
+          FROM public.tender_photos
+          WHERE tender_id = $1
+          ORDER BY display_order ASC
+        `,
+        params: [id],
+      },
+    ]);
+
+    if (tenderResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Tender not found or no longer open.' });
+    }
+
+    const photos = photosResult.rows.map((p) => {
+      const { data: { publicUrl } } = supabase.storage
+        .from('tender-media')
+        .getPublicUrl(p.storage_path);
+      return {
+        id: p.id,
+        storage_path: p.storage_path,
+        url: publicUrl,
+        type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
+      };
+    });
+
+    res.json({ success: true, tender: tenderResult.rows[0], photos });
+  } catch (err) {
+    console.error('GET /api/tenders/browse/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load tender.' });
   }
 });
 

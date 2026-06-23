@@ -4,11 +4,13 @@ const cors = require('cors');
 const path = require('path');
 require('dotenv').config();
 
-const authRoutes     = require('./routes/auth');
-const providersRoutes = require('./routes/providers');
-const servicesRoutes  = require('./routes/services');
-const tendersRoutes   = require('./routes/tenders');
-const adminRoutes     = require('./routes/admin');
+const authRoutes          = require('./routes/auth');
+const providersRoutes     = require('./routes/providers');
+const servicesRoutes      = require('./routes/services');
+const tendersRoutes       = require('./routes/tenders');
+const adminRoutes         = require('./routes/admin');
+const quotesRoutes        = require('./routes/quotes');
+const notificationsRoutes = require('./routes/notifications');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -29,11 +31,13 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Mount routes
-app.use('/api/auth',      authRoutes);
-app.use('/api/providers', providersRoutes);
-app.use('/api/services',  servicesRoutes);
-app.use('/api/tenders',   tendersRoutes);
-app.use('/api/admin',     adminRoutes);
+app.use('/api/auth',          authRoutes);
+app.use('/api/providers',     providersRoutes);
+app.use('/api/services',      servicesRoutes);
+app.use('/api/tenders',       tendersRoutes);
+app.use('/api/admin',         adminRoutes);
+app.use('/api/quotes',        quotesRoutes);
+app.use('/api/notifications', notificationsRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
