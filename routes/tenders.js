@@ -379,7 +379,9 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
 // by the homeowner-only wildcard route.
 // ============================================================
 router.get('/browse', authenticate, authorize('provider'), async (req, res) => {
-  const { category, parish, budgetMin, budgetMax, sort, search } = req.query;
+  const { category, parish, budgetMin, budgetMax, sort, search, offset } = req.query;
+  const PAGE_SIZE  = 20;
+  const rowOffset  = Math.max(0, parseInt(offset, 10) || 0);
   const params = [req.user.id];
   const conditions = ["t.status = 'open'"];
   let paramIdx = 2;
@@ -431,6 +433,13 @@ router.get('/browse', authenticate, authorize('provider'), async (req, res) => {
     ) DESC, t.created_at DESC`;
   }
 
+  // Fetch PAGE_SIZE + 1 rows so we can tell whether more pages exist
+  // without an extra COUNT query.
+  params.push(PAGE_SIZE + 1);  // $paramIdx   → LIMIT
+  const limitIdx = paramIdx++;
+  params.push(rowOffset);       // $paramIdx   → OFFSET
+  const offsetIdx = paramIdx++;
+
   try {
     const result = await db.queryAsUser(req.user.id, `
       SELECT
@@ -447,10 +456,13 @@ router.get('/browse', authenticate, authorize('provider'), async (req, res) => {
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
       ${whereClause}
       ${orderClause}
-      LIMIT 100
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
     `, params);
 
-    res.json({ success: true, tenders: result.rows });
+    const hasMore  = result.rows.length > PAGE_SIZE;
+    const tenders  = hasMore ? result.rows.slice(0, PAGE_SIZE) : result.rows;
+
+    res.json({ success: true, tenders, hasMore, offset: rowOffset });
   } catch (err) {
     console.error('GET /api/tenders/browse error:', err);
     res.status(500).json({ success: false, message: 'Failed to load tenders.' });

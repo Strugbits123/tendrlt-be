@@ -11,6 +11,7 @@ const tendersRoutes       = require('./routes/tenders');
 const adminRoutes         = require('./routes/admin');
 const quotesRoutes        = require('./routes/quotes');
 const notificationsRoutes = require('./routes/notifications');
+const pushRoutes          = require('./routes/push');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -38,6 +39,7 @@ app.use('/api/tenders',       tendersRoutes);
 app.use('/api/admin',         adminRoutes);
 app.use('/api/quotes',        quotesRoutes);
 app.use('/api/notifications', notificationsRoutes);
+app.use('/api/push',          pushRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

@@ -3,6 +3,7 @@ const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { notifyUser } = require('../lib/realtimeService');
 const { sendNewQuoteEmail } = require('../lib/quoteEmails');
+const { sendPushToUser } = require('../lib/pushService');
 
 const router = express.Router();
 
@@ -30,14 +31,14 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
   const amountCents = Math.round(Number(amount) * 100);
 
   try {
-    // Verify tender exists, is open, and is not the provider's own tender
+    // Step 1: verify tender exists and is accessible to this provider.
+    // Do NOT JOIN public.users here — provider RLS (users_select_own) only allows
+    // reading the provider's own user row, so a JOIN to the homeowner's row returns
+    // 0 rows and makes the whole query look like "Tender not found".
     const tenderCheck = await db.queryAsUser(req.user.id, `
       SELECT t.id, t.client_id, t.status,
-             u.email AS client_email,
-             (u.first_name || ' ' || u.last_name) AS client_name,
              st.display_name AS service_name
       FROM public.tenders t
-      JOIN public.users u ON u.id = t.client_id
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
       WHERE t.id = $1
     `, [tender_id]);
@@ -47,6 +48,15 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
     }
 
     const tender = tenderCheck.rows[0];
+
+    // Step 2: fetch homeowner contact info using the superuser pool (bypasses RLS).
+    // This is safe — it's a backend-only operation never exposed to the client.
+    const ownerResult = await db.query(
+      `SELECT email, (first_name || ' ' || last_name) AS client_name FROM public.users WHERE id = $1`,
+      [tender.client_id]
+    );
+    tender.client_email = ownerResult.rows[0]?.email ?? null;
+    tender.client_name  = ownerResult.rows[0]?.client_name ?? 'Homeowner';
 
     if (tender.status !== 'open') {
       return res.status(409).json({ success: false, message: 'This tender is no longer accepting quotes.' });
@@ -75,11 +85,12 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
 
     const quote = insertResult.rows[0];
 
-    // Bump the tender's quotes_count
-    await db.queryAsUser(req.user.id, `
-      UPDATE public.tenders SET quotes_count = quotes_count + 1, updated_at = NOW()
-      WHERE id = $1
-    `, [tender_id]);
+    // Bump the tender's quotes_count using superuser pool — provider RLS blocks
+    // tenders UPDATE (tenders_update_own requires client_id = current_user_id).
+    await db.query(
+      `UPDATE public.tenders SET quotes_count = quotes_count + 1, updated_at = NOW() WHERE id = $1`,
+      [tender_id]
+    );
 
     res.status(201).json({ success: true, quote });
 
@@ -116,6 +127,15 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
         `${providerName} submitted a quote of $${Math.round(amountCents / 100).toLocaleString()} on your ${tender.service_name || 'job'} tender.`,
         JSON.stringify({ tenderId: tender_id, quoteId: quote.id }),
       ]),
+
+      // Web Push to homeowner's devices
+      sendPushToUser(tender.client_id, {
+        title: `New quote from ${providerName}`,
+        body:  `$${Math.round(amountCents / 100).toLocaleString()} for your ${tender.service_name || 'job'} — tap to review`,
+        type:  'new_quote',
+        url:   '/dashboard',
+        data:  { tender_id, quote_id: quote.id },
+      }),
     ]).catch((err) => {
       console.warn('POST /api/quotes — side-effect error:', err.message);
     });
