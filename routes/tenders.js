@@ -5,6 +5,8 @@ const { createClient } = require('@supabase/supabase-js');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { notifyUser, notifyChannel } = require('../lib/realtimeService');
+const { sendNewTenderEmail } = require('../lib/tenderEmails');
+const { sendPushToUser }     = require('../lib/pushService');
 
 const router = express.Router();
 
@@ -28,6 +30,84 @@ const PATCHABLE = [
   'contact_name', 'contact_phone', 'contact_email',
   'location_lat', 'location_lng',
 ];
+
+// ============================================================
+// notifyMatchedProviders
+// Called (fire-and-forget) when a tender transitions to 'open'.
+// Finds all providers who:
+//   - cover the tender's parish (provider_parishes)
+//   - offer the tender's service category (provider_services)
+// Then sends each of them: in-app notification, realtime bell update,
+// push notification, and email — all in parallel, all non-fatal.
+// ============================================================
+async function notifyMatchedProviders(tender) {
+  // Superuser query — no RLS restriction needed; backend-only fan-out.
+  const matchResult = await db.query(`
+    SELECT DISTINCT u.id AS provider_id, u.email, u.first_name, u.last_name
+    FROM public.provider_parishes pp
+    JOIN public.users u        ON u.id = pp.provider_id
+    JOIN public.provider_services ps ON ps.provider_id = pp.provider_id
+    WHERE pp.parish    = $1
+      AND ps.category  = $2::service_category
+      AND u.role       = 'provider'
+  `, [tender.parish, tender.category]);
+
+  const providers = matchResult.rows;
+  if (!providers.length) {
+    console.log(`[tender-notify] No matched providers for tender ${tender.id} (parish=${tender.parish}, category=${tender.category})`);
+    return;
+  }
+
+  console.log(`[tender-notify] Notifying ${providers.length} provider(s) for tender ${tender.id}`);
+
+  // Resolve human-readable service name for notification copy
+  const stRow = await db.query(
+    `SELECT display_name FROM public.service_types WHERE slug = $1`,
+    [tender.category]
+  );
+  const serviceName = stRow.rows[0]?.display_name || tender.category;
+  const tenderUrl   = `/tender/${tender.id}`;
+
+  await Promise.allSettled(providers.map(async (p) => {
+    const providerName = `${p.first_name} ${p.last_name}`.trim() || 'there';
+
+    // 1. Persistent in-app notification (shows in the bell dropdown)
+    db.query(`
+      INSERT INTO public.notifications (user_id, type, title, body, data)
+      VALUES ($1, 'new_tender', $2, $3, $4::jsonb)
+    `, [
+      p.provider_id,
+      `New ${serviceName} job in ${tender.parish}`,
+      `A homeowner posted a ${serviceName} tender in ${tender.parish}. Be first to quote!`,
+      JSON.stringify({ tenderId: tender.id, url: tenderUrl }),
+    ]).catch(err => console.warn('[tender-notify] notification insert error:', err.message));
+
+    // 2. Realtime — provider's bell badge increments immediately without page refresh
+    notifyUser(p.provider_id, 'new-tender', {
+      tenderId: tender.id,
+      category: tender.category,
+      parish:   tender.parish,
+      url:      tenderUrl,
+    }).catch(() => {});
+
+    // 3. PWA push notification to all of this provider's subscribed devices
+    sendPushToUser(p.provider_id, {
+      title: `New ${serviceName} job in ${tender.parish} 🏡`,
+      body:  `A homeowner needs ${serviceName} work done. Tap to view and submit a quote!`,
+      url:   tenderUrl,
+      type:  'new_tender',
+      data:  { tender_id: tender.id },
+    }).catch(() => {});
+
+    // 4. Email
+    sendNewTenderEmail(p.email, {
+      providerName,
+      serviceType: serviceName,
+      parish:      tender.parish,
+      tenderId:    tender.id,
+    }).catch(err => console.warn('[tender-notify] email error:', err.message));
+  }));
+}
 
 // ============================================================
 // POST /api/tenders
@@ -131,14 +211,24 @@ router.post('/',
       }
 
       res.status(201).json({ success: true, tender, newPhotos });
-      // Fire-and-forget side effects
+
+      // Fire-and-forget: update the homeowner's own My Tenders view
       notifyUser(req.user.id, 'tenders-updated', { tenderId: tender.id }).catch(() => {});
-      // Broadcast to all providers browsing — new tender available
-      notifyChannel('tenders-feed', 'tender-added', {
-        tenderId: tender.id,
-        category: tender.category,
-        parish:   tender.parish,
-      }).catch(() => {});
+
+      if (tender.status === 'open') {
+        // Broadcast to the shared tenders-feed channel so all provider browse
+        // pages refresh their list in real-time without polling.
+        notifyChannel('tenders-feed', 'tender-added', {
+          tenderId: tender.id,
+          category: tender.category,
+          parish:   tender.parish,
+        }).catch(() => {});
+
+        // Fan-out: email + in-app notification + push to matched providers
+        notifyMatchedProviders(tender).catch(err =>
+          console.warn('[tender-notify] POST fan-out error:', err.message)
+        );
+      }
     } catch (err) {
       console.error('POST /api/tenders error:', err);
       res.status(500).json({ success: false, message: 'Failed to create tender.' });
@@ -163,6 +253,7 @@ router.patch('/:id',
     // An already-published (open) tender can only be edited while it has NO
     // quotes. Once a provider has quoted, the brief is locked. Drafts and the
     // draft→open publish step are unaffected (a draft has no quotes yet).
+    let currentStatus;
     try {
       const guard = await db.queryAsUserBatch(req.user.id, [
         { text: `SELECT status FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
@@ -171,7 +262,7 @@ router.patch('/:id',
       if (guard[0].rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Tender not found.' });
       }
-      const currentStatus = guard[0].rows[0].status;
+      currentStatus = guard[0].rows[0].status;
       const quoteCount = guard[1].rows[0].n;
       if (currentStatus === 'open' && quoteCount > 0) {
         return res.status(409).json({
@@ -306,8 +397,22 @@ router.patch('/:id',
       }
 
       res.json({ success: true, tender, newPhotos });
-      // Fire-and-forget — notify the user's client so My Tenders refetches.
+
+      // Fire-and-forget: update the homeowner's own My Tenders view
       notifyUser(req.user.id, 'tenders-updated', { tenderId: id }).catch(() => {});
+
+      // Draft → open: first publish. Fan-out to matched providers.
+      if (status === 'open' && currentStatus === 'draft') {
+        notifyChannel('tenders-feed', 'tender-added', {
+          tenderId: tender.id,
+          category: tender.category,
+          parish:   tender.parish,
+        }).catch(() => {});
+
+        notifyMatchedProviders(tender).catch(err =>
+          console.warn('[tender-notify] PATCH fan-out error:', err.message)
+        );
+      }
     } catch (err) {
       console.error('PATCH /api/tenders/:id error:', err);
       res.status(500).json({ success: false, message: 'Failed to update tender.' });
