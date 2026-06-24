@@ -39,8 +39,11 @@ const PATCHABLE = [
 //   - offer the tender's service category (provider_services)
 // Then sends each of them: in-app notification, realtime bell update,
 // push notification, and email — all in parallel, all non-fatal.
+//
+// preServiceName / preServiceEmoji — pass these when the caller has
+// already queried service_types so we avoid a redundant DB round-trip.
 // ============================================================
-async function notifyMatchedProviders(tender) {
+async function notifyMatchedProviders(tender, preServiceName = null, preServiceEmoji = null) {
   // Superuser query — no RLS restriction needed; backend-only fan-out.
   const matchResult = await db.query(`
     SELECT DISTINCT u.id AS provider_id, u.email, u.first_name, u.last_name
@@ -60,13 +63,18 @@ async function notifyMatchedProviders(tender) {
 
   console.log(`[tender-notify] Notifying ${providers.length} provider(s) for tender ${tender.id}`);
 
-  // Resolve human-readable service name for notification copy
-  const stRow = await db.query(
-    `SELECT display_name FROM public.service_types WHERE slug = $1`,
-    [tender.category]
-  );
-  const serviceName = stRow.rows[0]?.display_name || tender.category;
-  const tenderUrl   = `/tender/${tender.id}`;
+  // Use caller-supplied names or query them once
+  let serviceName  = preServiceName;
+  let serviceEmoji = preServiceEmoji;
+  if (!serviceName) {
+    const stRow = await db.query(
+      `SELECT display_name, emoji FROM public.service_types WHERE slug = $1`,
+      [tender.category]
+    );
+    serviceName  = stRow.rows[0]?.display_name || tender.category;
+    serviceEmoji = stRow.rows[0]?.emoji ?? '🔧';
+  }
+  const tenderUrl = `/tender/${tender.id}`;
 
   await Promise.allSettled(providers.map(async (p) => {
     const providerName = `${p.first_name} ${p.last_name}`.trim() || 'there';
@@ -216,18 +224,43 @@ router.post('/',
       notifyUser(req.user.id, 'tenders-updated', { tenderId: tender.id }).catch(() => {});
 
       if (tender.status === 'open') {
-        // Broadcast to the shared tenders-feed channel so all provider browse
-        // pages refresh their list in real-time without polling.
-        notifyChannel('tenders-feed', 'tender-added', {
-          tenderId: tender.id,
-          category: tender.category,
-          parish:   tender.parish,
-        }).catch(() => {});
+        // Single service_types lookup shared by the broadcast and per-provider
+        // notifications so we avoid two identical round-trips.
+        db.query(
+          `SELECT display_name, emoji FROM public.service_types WHERE slug = $1`,
+          [tender.category]
+        ).then(({ rows }) => {
+          const svcName  = rows[0]?.display_name ?? tender.category;
+          const svcEmoji = rows[0]?.emoji ?? '🔧';
 
-        // Fan-out: email + in-app notification + push to matched providers
-        notifyMatchedProviders(tender).catch(err =>
-          console.warn('[tender-notify] POST fan-out error:', err.message)
-        );
+          // Broadcast full card payload to tenders-feed so provider browse pages
+          // can inject the new tender directly without an extra API call.
+          notifyChannel('tenders-feed', 'tender-added', {
+            tenderId:             tender.id,
+            category:             tender.category,
+            parish:               tender.parish,
+            description:          tender.description,
+            urgency:              tender.urgency,
+            budget_min:           tender.budget_min,
+            budget_max:           tender.budget_max,
+            created_at:           tender.created_at,
+            photos_count:         tender.photos_count || 0,
+            preferred_start_date: tender.preferred_start_date,
+            service_name:         svcName,
+            service_emoji:        svcEmoji,
+          }).catch(() => {});
+
+          // Fan-out: email + in-app notification + push to matched providers
+          notifyMatchedProviders(tender, svcName, svcEmoji).catch(err =>
+            console.warn('[tender-notify] POST fan-out error:', err.message)
+          );
+        }).catch(() => {
+          // Fallback if service lookup fails — minimal broadcast + regular notify
+          notifyChannel('tenders-feed', 'tender-added', {
+            tenderId: tender.id, category: tender.category, parish: tender.parish,
+          }).catch(() => {});
+          notifyMatchedProviders(tender).catch(() => {});
+        });
       }
     } catch (err) {
       console.error('POST /api/tenders error:', err);
@@ -403,15 +436,37 @@ router.patch('/:id',
 
       // Draft → open: first publish. Fan-out to matched providers.
       if (status === 'open' && currentStatus === 'draft') {
-        notifyChannel('tenders-feed', 'tender-added', {
-          tenderId: tender.id,
-          category: tender.category,
-          parish:   tender.parish,
-        }).catch(() => {});
+        db.query(
+          `SELECT display_name, emoji FROM public.service_types WHERE slug = $1`,
+          [tender.category]
+        ).then(({ rows }) => {
+          const svcName  = rows[0]?.display_name ?? tender.category;
+          const svcEmoji = rows[0]?.emoji ?? '🔧';
 
-        notifyMatchedProviders(tender).catch(err =>
-          console.warn('[tender-notify] PATCH fan-out error:', err.message)
-        );
+          notifyChannel('tenders-feed', 'tender-added', {
+            tenderId:             tender.id,
+            category:             tender.category,
+            parish:               tender.parish,
+            description:          tender.description,
+            urgency:              tender.urgency,
+            budget_min:           tender.budget_min,
+            budget_max:           tender.budget_max,
+            created_at:           tender.created_at,
+            photos_count:         tender.photos_count || 0,
+            preferred_start_date: tender.preferred_start_date,
+            service_name:         svcName,
+            service_emoji:        svcEmoji,
+          }).catch(() => {});
+
+          notifyMatchedProviders(tender, svcName, svcEmoji).catch(err =>
+            console.warn('[tender-notify] PATCH fan-out error:', err.message)
+          );
+        }).catch(() => {
+          notifyChannel('tenders-feed', 'tender-added', {
+            tenderId: tender.id, category: tender.category, parish: tender.parish,
+          }).catch(() => {});
+          notifyMatchedProviders(tender).catch(() => {});
+        });
       }
     } catch (err) {
       console.error('PATCH /api/tenders/:id error:', err);
