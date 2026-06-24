@@ -349,6 +349,36 @@ router.delete('/upload/portfolio', authenticate, authorize('provider'), async (r
 });
 
 // ============================================================
+// GET /api/providers/stats
+// KPI counts for the provider dashboard header cards.
+// ============================================================
+router.get('/stats', authenticate, authorize('provider'), async (req, res) => {
+  try {
+    const result = await db.queryAsUser(req.user.id, `
+      SELECT
+        (SELECT COUNT(*)::int FROM public.tenders WHERE status = 'open') AS open_tenders,
+        (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = $1) AS quotes_submitted,
+        (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = $1 AND status = 'accepted') AS jobs_won,
+        (SELECT ROUND(AVG(rating)::numeric, 1) FROM public.reviews WHERE provider_id = $1) AS avg_rating,
+        (SELECT COUNT(*)::int FROM public.reviews WHERE provider_id = $1) AS review_count
+    `, [req.user.id]);
+
+    const row = result.rows[0];
+    res.json({
+      success: true,
+      openTenders:      row.open_tenders    ?? 0,
+      quotesSubmitted:  row.quotes_submitted ?? 0,
+      jobsWon:          row.jobs_won         ?? 0,
+      avgRating:        row.avg_rating       ? parseFloat(row.avg_rating) : null,
+      reviewCount:      row.review_count     ?? 0,
+    });
+  } catch (err) {
+    console.error('GET /api/providers/stats error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load stats.' });
+  }
+});
+
+// ============================================================
 // POST /api/providers/go-live
 // Sets is_onboarding_complete = TRUE on the provider's profile.
 // Only succeeds if a profile row already exists (step 1 must be saved first).
