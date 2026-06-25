@@ -154,6 +154,91 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
 });
 
 // ============================================================
+// GET /api/quotes/received
+// Returns all quotes on the homeowner's tenders.
+// Optional query param: ?tender_id=<uuid> to filter by tender.
+// ============================================================
+router.get('/received', authenticate, authorize('homeowner'), async (req, res) => {
+  const { tender_id } = req.query;
+  try {
+    const params = [req.user.id];
+    let extra = '';
+    if (tender_id) {
+      params.push(tender_id);
+      extra = ` AND q.tender_id = $2`;
+    }
+    const result = await db.query(`
+      SELECT
+        q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
+        q.message, q.what_is_included, q.status, q.created_at,
+        u.id         AS provider_id,
+        u.first_name AS provider_first_name,
+        u.last_name  AS provider_last_name,
+        st.display_name AS tender_title,
+        st.emoji        AS tender_emoji
+      FROM public.quotes q
+      JOIN public.tenders t  ON t.id  = q.tender_id
+      JOIN public.users   u  ON u.id  = q.provider_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      WHERE t.client_id = $1${extra}
+      ORDER BY q.created_at DESC
+    `, params);
+    res.json({ success: true, quotes: result.rows });
+  } catch (err) {
+    console.error('GET /api/quotes/received error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load quotes.' });
+  }
+});
+
+// ============================================================
+// PATCH /api/quotes/:id/accept
+// Homeowner accepts a quote; all other quotes on the same tender
+// are set to 'rejected'.
+// ============================================================
+router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await db.query(`
+      SELECT q.id, q.tender_id, q.provider_id, t.client_id
+      FROM public.quotes q
+      JOIN public.tenders t ON t.id = q.tender_id
+      WHERE q.id = $1
+    `, [id]);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Quote not found.' });
+    }
+    const row = check.rows[0];
+    if (row.client_id !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Forbidden.' });
+    }
+
+    // Reject every other quote on the tender; capture the losing providers so we
+    // can push them a realtime event (their "My Quotes" flips to "Not selected").
+    const rejected = await db.query(
+      `UPDATE public.quotes SET status = 'rejected', updated_at = NOW()
+       WHERE tender_id = $1 AND id != $2 RETURNING id, provider_id`,
+      [row.tender_id, id]
+    );
+    await db.query(
+      `UPDATE public.quotes SET status = 'accepted', updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    res.json({ success: true });
+
+    // Realtime fan-out — winner first, then each losing provider.
+    notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }).catch(() => {});
+    for (const r of rejected.rows) {
+      notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('PATCH /api/quotes/:id/accept error:', err);
+    res.status(500).json({ success: false, message: 'Failed to accept quote.' });
+  }
+});
+
+// ============================================================
 // GET /api/quotes/mine
 // Returns all quotes submitted by the current provider.
 // ============================================================
@@ -163,7 +248,7 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
       SELECT
         q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
         q.message, q.what_is_included, q.status, q.created_at,
-        t.parish, t.urgency,
+        t.parish, t.urgency, t.category,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
       FROM public.quotes q
@@ -177,6 +262,53 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
   } catch (err) {
     console.error('GET /api/quotes/mine error:', err);
     res.status(500).json({ success: false, message: 'Failed to load quotes.' });
+  }
+});
+
+// ============================================================
+// GET /api/quotes/:id
+// Returns full details of a single quote.
+// Must come AFTER all static paths (/received, /mine) so the
+// wildcard /:id does not shadow them.
+// Access: homeowner who owns the tender, OR provider who submitted the quote.
+// ============================================================
+router.get('/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await db.query(`
+      SELECT
+        q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
+        q.message, q.what_is_included, q.status, q.created_at,
+        u.id         AS provider_id,
+        u.first_name AS provider_first_name,
+        u.last_name  AS provider_last_name,
+        st.display_name AS tender_title,
+        st.emoji        AS tender_emoji,
+        t.client_id
+      FROM public.quotes q
+      JOIN public.tenders t  ON t.id  = q.tender_id
+      JOIN public.users   u  ON u.id  = q.provider_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      WHERE q.id = $1
+    `, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Quote not found.' });
+    }
+
+    const row = result.rows[0];
+    const isHomeowner = req.user.role === 'homeowner' && row.client_id === req.user.id;
+    const isProvider  = req.user.role === 'provider'  && row.provider_id === req.user.id;
+
+    if (!isHomeowner && !isProvider) {
+      return res.status(403).json({ success: false, message: 'Forbidden.' });
+    }
+
+    const { client_id: _omit, ...quote } = row;
+    res.json({ success: true, quote });
+  } catch (err) {
+    console.error('GET /api/quotes/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load quote.' });
   }
 });
 
