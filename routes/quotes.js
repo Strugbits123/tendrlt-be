@@ -213,8 +213,11 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
       return res.status(403).json({ success: false, message: 'Forbidden.' });
     }
 
-    await db.query(
-      `UPDATE public.quotes SET status = 'rejected', updated_at = NOW() WHERE tender_id = $1 AND id != $2`,
+    // Reject every other quote on the tender; capture the losing providers so we
+    // can push them a realtime event (their "My Quotes" flips to "Not selected").
+    const rejected = await db.query(
+      `UPDATE public.quotes SET status = 'rejected', updated_at = NOW()
+       WHERE tender_id = $1 AND id != $2 RETURNING id, provider_id`,
       [row.tender_id, id]
     );
     await db.query(
@@ -224,7 +227,11 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
 
     res.json({ success: true });
 
+    // Realtime fan-out — winner first, then each losing provider.
     notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }).catch(() => {});
+    for (const r of rejected.rows) {
+      notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id }).catch(() => {});
+    }
   } catch (err) {
     console.error('PATCH /api/quotes/:id/accept error:', err);
     res.status(500).json({ success: false, message: 'Failed to accept quote.' });
@@ -241,7 +248,7 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
       SELECT
         q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
         q.message, q.what_is_included, q.status, q.created_at,
-        t.parish, t.urgency,
+        t.parish, t.urgency, t.category,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
       FROM public.quotes q
