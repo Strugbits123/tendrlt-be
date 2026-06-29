@@ -724,6 +724,205 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
 });
 
 // ============================================================
+// PUBLIC ENDPOINTS (no auth)
+// Read-only views of OPEN tenders for the public Explore page and
+// public tender-detail page. These run as the superuser (db.query),
+// hard-filter status='open', and NEVER expose contact/location PII.
+// Declared BEFORE the '/:id' homeowner route so the literal '/public'
+// path is not captured by the ':id' param.
+// ============================================================
+const PUBLIC_CACHE = 'public, max-age=60, stale-while-revalidate=300';
+
+// GET /api/tenders/public — list open tenders with filters + sort + paging.
+router.get('/public', async (req, res) => {
+  const { category, parish, budgetMin, budgetMax, sort, search, offset, status } = req.query;
+  const PAGE_SIZE = 20;
+  const rowOffset = Math.max(0, parseInt(offset, 10) || 0);
+  const params = [];
+  const conditions = ["t.status = 'open'"];
+  let paramIdx = 1;
+
+  // UI "status" filter: only-open tenders are ever returned, so this narrows by
+  // recency ('new' = posted today) or urgency ('urgent').
+  if (status === 'new') {
+    conditions.push(`t.created_at >= date_trunc('day', now())`);
+  } else if (status === 'urgent') {
+    conditions.push(`t.urgency IN ('emergency', 'urgent')`);
+  }
+
+  if (category) {
+    conditions.push(`t.category = $${paramIdx}::service_category`);
+    params.push(category);
+    paramIdx++;
+  }
+
+  if (parish) {
+    conditions.push(`t.parish = $${paramIdx}`);
+    params.push(parish);
+    paramIdx++;
+  }
+
+  if (budgetMin) {
+    const minCents = Math.round(parseFloat(budgetMin) * 100);
+    if (!isNaN(minCents)) {
+      conditions.push(`t.budget_max >= $${paramIdx}`);
+      params.push(minCents);
+      paramIdx++;
+    }
+  }
+
+  if (budgetMax) {
+    const maxCents = Math.round(parseFloat(budgetMax) * 100);
+    if (!isNaN(maxCents)) {
+      conditions.push(`t.budget_min <= $${paramIdx}`);
+      params.push(maxCents);
+      paramIdx++;
+    }
+  }
+
+  if (search) {
+    conditions.push(`(t.description ILIKE $${paramIdx} OR st.display_name ILIKE $${paramIdx} OR t.parish ILIKE $${paramIdx})`);
+    params.push(`%${search}%`);
+    paramIdx++;
+  }
+
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  let orderClause = 'ORDER BY t.created_at DESC';
+  if (sort === 'budget_high') {
+    orderClause = 'ORDER BY t.budget_max DESC NULLS LAST, t.created_at DESC';
+  } else if (sort === 'fewest_quotes') {
+    orderClause = 'ORDER BY t.quotes_count ASC, t.created_at DESC';
+  }
+
+  params.push(PAGE_SIZE + 1);
+  const limitIdx = paramIdx++;
+  params.push(rowOffset);
+  const offsetIdx = paramIdx++;
+
+  try {
+    const result = await db.query(`
+      SELECT
+        t.id, t.category, t.parish, t.description, t.urgency,
+        t.budget_min, t.budget_max, t.created_at, t.quotes_count,
+        t.photos_count, t.preferred_start_date,
+        COUNT(*) OVER() AS total_count,
+        st.display_name AS service_name,
+        st.emoji        AS service_emoji
+      FROM public.tenders t
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      ${whereClause}
+      ${orderClause}
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+    `, params);
+
+    const hasMore = result.rows.length > PAGE_SIZE;
+    const rows    = hasMore ? result.rows.slice(0, PAGE_SIZE) : result.rows;
+    const total   = result.rows.length > 0 ? parseInt(result.rows[0].total_count, 10) : 0;
+    const tenders = rows.map(({ total_count, ...rest }) => rest);
+
+    res.set('Cache-Control', PUBLIC_CACHE);
+    res.json({ success: true, tenders, hasMore, offset: rowOffset, total });
+  } catch (err) {
+    console.error('GET /api/tenders/public error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load tenders.' });
+  }
+});
+
+// GET /api/tenders/public/stats — aggregate counts for hero + category sidebar.
+router.get('/public/stats', async (req, res) => {
+  try {
+    const [totals, byCategory] = await Promise.all([
+      db.query(`
+        SELECT
+          COUNT(*)::int                                                         AS open_tenders,
+          COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now()))::int   AS new_today,
+          COUNT(DISTINCT parish)::int                                           AS parish_count,
+          COUNT(DISTINCT category)::int                                         AS category_count
+        FROM public.tenders
+        WHERE status = 'open'
+      `),
+      db.query(`
+        SELECT category, COUNT(*)::int AS count
+        FROM public.tenders
+        WHERE status = 'open'
+        GROUP BY category
+      `),
+    ]);
+
+    const t = totals.rows[0] || {};
+    res.set('Cache-Control', PUBLIC_CACHE);
+    res.json({
+      success: true,
+      openTenders:   t.open_tenders   ?? 0,
+      newToday:      t.new_today      ?? 0,
+      parishCount:   t.parish_count   ?? 0,
+      categoryCount: t.category_count ?? 0,
+      categoryCounts: byCategory.rows,
+    });
+  } catch (err) {
+    console.error('GET /api/tenders/public/stats error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load stats.' });
+  }
+});
+
+// GET /api/tenders/public/:id — single open tender detail (no PII).
+router.get('/public/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [tenderResult, photosResult] = await Promise.all([
+      db.query(`
+        SELECT
+          t.id, t.category, t.parish, t.description, t.urgency, t.urgency_note,
+          t.budget_min, t.budget_max, t.created_at, t.quotes_count,
+          t.photos_count, t.preferred_start_date, t.status,
+          (
+            SELECT first_name || ' ' || LEFT(last_name, 1) || '.'
+            FROM public.users WHERE id = t.client_id
+          ) AS client_display_name,
+          (
+            SELECT COUNT(*)::int FROM public.tenders
+            WHERE client_id = t.client_id AND status IN ('open', 'in_progress', 'completed')
+          ) AS client_jobs_posted,
+          st.display_name AS service_name,
+          st.emoji        AS service_emoji
+        FROM public.tenders t
+        LEFT JOIN public.service_types st ON st.id = t.service_type_id
+        WHERE t.id = $1 AND t.status = 'open'
+      `, [id]),
+      db.query(`
+        SELECT id, storage_path, display_order
+        FROM public.tender_photos
+        WHERE tender_id = $1
+        ORDER BY display_order ASC
+      `, [id]),
+    ]);
+
+    if (tenderResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Tender not found or no longer open.' });
+    }
+
+    const photos = photosResult.rows.map((p) => {
+      const { data: { publicUrl } } = supabase.storage
+        .from('tender-media')
+        .getPublicUrl(p.storage_path);
+      return {
+        id: p.id,
+        storage_path: p.storage_path,
+        url: publicUrl,
+        type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
+      };
+    });
+
+    res.set('Cache-Control', PUBLIC_CACHE);
+    res.json({ success: true, tender: tenderResult.rows[0], photos });
+  } catch (err) {
+    console.error('GET /api/tenders/public/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load tender.' });
+  }
+});
+
+// ============================================================
 // GET /api/tenders/:id
 // Returns a single tender for the current homeowner.
 // Used by post-job page to pre-populate draft form.

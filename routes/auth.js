@@ -7,6 +7,7 @@ const axios = require('axios');
 const { Resend } = require('resend');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
+const { requireTurnstile } = require('../lib/turnstile');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
@@ -142,7 +143,7 @@ const sendPasswordResetEmail = async (email, token, firstName) => {
  * POST /api/auth/register
  * Register a user via email/password — sends verification email
  */
-router.post('/register', async (req, res) => {
+router.post('/register', requireTurnstile, async (req, res) => {
   const { email, password, first_name, last_name, phone_number, parish, role, provider_service } = req.body;
 
   if (!email || !password || !first_name || !last_name || !phone_number || !parish || !role) {
@@ -328,7 +329,7 @@ router.post('/resend-verification', async (req, res) => {
  * POST /api/auth/login
  * Sign in a user via email/password
  */
-router.post('/login', async (req, res) => {
+router.post('/login', requireTurnstile, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
