@@ -357,6 +357,11 @@ router.get('/stats', authenticate, authorize('provider'), async (req, res) => {
     const result = await db.queryAsUser(req.user.id, `
       SELECT
         (SELECT COUNT(*)::int FROM public.tenders WHERE status = 'open') AS open_tenders,
+        (SELECT COUNT(*)::int FROM public.tenders t
+           WHERE t.status = 'open'
+             AND t.category IN (
+               SELECT category FROM public.provider_services WHERE provider_id = $1
+             )) AS matched_open_tenders,
         (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = $1) AS quotes_submitted,
         (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = $1 AND status = 'accepted') AS jobs_won,
         (SELECT ROUND(AVG(rating)::numeric, 1) FROM public.reviews WHERE provider_id = $1) AS avg_rating,
@@ -366,11 +371,12 @@ router.get('/stats', authenticate, authorize('provider'), async (req, res) => {
     const row = result.rows[0];
     res.json({
       success: true,
-      openTenders:      row.open_tenders    ?? 0,
-      quotesSubmitted:  row.quotes_submitted ?? 0,
-      jobsWon:          row.jobs_won         ?? 0,
-      avgRating:        row.avg_rating       ? parseFloat(row.avg_rating) : null,
-      reviewCount:      row.review_count     ?? 0,
+      openTenders:         row.open_tenders         ?? 0,
+      matchedOpenTenders:  row.matched_open_tenders  ?? 0,
+      quotesSubmitted:     row.quotes_submitted      ?? 0,
+      jobsWon:             row.jobs_won              ?? 0,
+      avgRating:           row.avg_rating            ? parseFloat(row.avg_rating) : null,
+      reviewCount:         row.review_count          ?? 0,
     });
   } catch (err) {
     console.error('GET /api/providers/stats error:', err);
