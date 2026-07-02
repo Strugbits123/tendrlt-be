@@ -12,6 +12,8 @@ const adminRoutes         = require('./routes/admin');
 const quotesRoutes        = require('./routes/quotes');
 const notificationsRoutes = require('./routes/notifications');
 const pushRoutes          = require('./routes/push');
+const contactRoutes       = require('./routes/contact');
+const feedbackRoutes      = require('./routes/feedback');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -40,6 +42,8 @@ app.use('/api/admin',         adminRoutes);
 app.use('/api/quotes',        quotesRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/push',          pushRoutes);
+app.use('/api/contact',       contactRoutes);
+app.use('/api/feedback',      feedbackRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
