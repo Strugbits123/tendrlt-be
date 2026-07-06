@@ -356,14 +356,23 @@ router.get('/stats', authenticate, authorize('provider'), async (req, res) => {
   try {
     const result = await db.queryAsUser(req.user.id, `
       SELECT
-        (SELECT COUNT(*)::int FROM public.tenders WHERE status = 'open') AS open_tenders,
+        -- Only live tenders: open, not admin-removed, not expired (matches Browse).
+        (SELECT COUNT(*)::int FROM public.tenders
+           WHERE status = 'open' AND trashed_at IS NULL
+             AND (expires_at IS NULL OR expires_at > NOW())) AS open_tenders,
         (SELECT COUNT(*)::int FROM public.tenders t
-           WHERE t.status = 'open'
+           WHERE t.status = 'open' AND t.trashed_at IS NULL
+             AND (t.expires_at IS NULL OR t.expires_at > NOW())
              AND t.category IN (
                SELECT category FROM public.provider_services WHERE provider_id = $1
              )) AS matched_open_tenders,
-        (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = $1) AS quotes_submitted,
-        (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = $1 AND status = 'accepted') AS jobs_won,
+        -- Quotes on admin-removed tenders are hidden, so exclude them (matches My Quotes).
+        (SELECT COUNT(*)::int FROM public.quotes q
+           JOIN public.tenders t ON t.id = q.tender_id
+           WHERE q.provider_id = $1 AND t.trashed_at IS NULL) AS quotes_submitted,
+        (SELECT COUNT(*)::int FROM public.quotes q
+           JOIN public.tenders t ON t.id = q.tender_id
+           WHERE q.provider_id = $1 AND q.status = 'accepted' AND t.trashed_at IS NULL) AS jobs_won,
         (SELECT ROUND(AVG(rating)::numeric, 1) FROM public.reviews WHERE provider_id = $1) AS avg_rating,
         (SELECT COUNT(*)::int FROM public.reviews WHERE provider_id = $1) AS review_count
     `, [req.user.id]);

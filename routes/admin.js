@@ -7,7 +7,7 @@ const {
   sendProviderApprovedEmail,
   sendProviderRejectedEmail,
 } = require('../lib/verificationEmails');
-const { notifyUser } = require('../lib/realtimeService');
+const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendTenderRemovedEmail } = require('../lib/tenderEmails');
 
 const router = express.Router();
@@ -447,6 +447,26 @@ router.get('/tenders', async (req, res) => {
   }
 });
 
+// GET /api/admin/tenders/active-count — count of live "Active" tenders for the
+// sidebar badge (open, not admin-removed, not expired, not yet awarded) — mirrors
+// the Active/Live bucket on the admin Tenders page.
+router.get('/tenders/active-count', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT COUNT(*)::int AS count
+      FROM public.tenders t
+      WHERE t.status = 'open'
+        AND t.trashed_at IS NULL
+        AND (t.expires_at IS NULL OR t.expires_at > NOW())
+        AND NOT EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = t.id AND q.status = 'accepted')
+    `);
+    res.json({ success: true, count: r.rows[0].count });
+  } catch (err) {
+    console.error('GET /api/admin/tenders/active-count error:', err);
+    res.status(500).json({ success: false, message: 'Failed to count tenders.' });
+  }
+});
+
 // POST /api/admin/tenders/:code/trash — soft-delete (hides from browse/explore
 // and marks the homeowner's copy "Rejected by admin"). Optional { reason }.
 router.post('/tenders/:code/trash', async (req, res) => {
@@ -490,6 +510,8 @@ router.post('/tenders/:code/trash', async (req, res) => {
       ),
       // Refresh the My Quotes list of every provider who quoted — their quote is now hidden.
       notifyQuoteProviders(t.id),
+      // Drop it from every provider's Browse grid + recount their stats, live.
+      notifyChannel('tenders-feed', 'tender-removed', { tenderId: t.id }),
     ]).catch((err) => console.warn('trash notify error:', err.message));
   } catch (err) {
     console.error('POST /api/admin/tenders/:code/trash error:', err);
@@ -528,6 +550,8 @@ router.post('/tenders/:code/restore', async (req, res) => {
       ),
       // Refresh My Quotes for providers who quoted — their quote is visible again.
       notifyQuoteProviders(t.id),
+      // Re-add it to providers' Browse grids + recount, live.
+      notifyChannel('tenders-feed', 'tender-restored', { tenderId: t.id }),
     ]).catch((err) => console.warn('restore notify error:', err.message));
   } catch (err) {
     console.error('POST /api/admin/tenders/:code/restore error:', err);
@@ -571,6 +595,186 @@ router.delete('/tenders/:code/quotes/:pid', async (req, res) => {
   } catch (err) {
     console.error('DELETE /api/admin/tenders/:code/quotes/:pid error:', err);
     res.status(500).json({ success: false, message: 'Failed to remove quote.' });
+  }
+});
+
+// ============================================================
+// Platform Fee Configuration (admin-only)
+// Reads/writes platform_fee_config (singleton) + fee_change_history (audit).
+// Every change broadcasts on 'platform-fees' so the whole app updates live.
+// ============================================================
+
+const num = (v) => (v == null ? null : parseFloat(v));
+
+// Map a DB history row to the admin-screen HistoryEntry shape.
+const shapeFeeHistory = (h) => {
+  const created = new Date(h.created_at);
+  return {
+    id:           h.code,
+    date:         created.toISOString().slice(0, 10),
+    time:         created.toISOString().slice(11, 16),
+    by:           h.changed_by_name || 'TendrIt Admin',
+    role:         'Platform Owner',
+    type:         h.type,
+    old_client:   num(h.old_client),
+    old_provider: num(h.old_provider),
+    new_client:   num(h.new_client),
+    new_provider: num(h.new_provider),
+    effective:    h.effective ? new Date(h.effective).toISOString().slice(0, 10) : null,
+    reason:       h.reason || '',
+    status:       h.status,
+    batches_applied: 0,
+  };
+};
+
+async function loadFeeConfig() {
+  const [cfg, hist] = await Promise.all([
+    db.query('SELECT * FROM public.platform_fee_config WHERE id = 1'),
+    db.query(`
+      SELECT h.*, (u.first_name || ' ' || u.last_name) AS changed_by_name
+      FROM public.fee_change_history h
+      LEFT JOIN public.users u ON u.id = h.changed_by
+      ORDER BY h.created_at ASC
+    `),
+  ]);
+  const c = cfg.rows[0] || {};
+  return {
+    config: {
+      client_rate:   num(c.client_rate),
+      provider_rate: num(c.provider_rate),
+      client_effective:   c.client_effective ? new Date(c.client_effective).toISOString().slice(0, 10) : null,
+      provider_effective: c.provider_effective ? new Date(c.provider_effective).toISOString().slice(0, 10) : null,
+    },
+    history: hist.rows.map(shapeFeeHistory),
+  };
+}
+
+const broadcastFees = (config) =>
+  notifyChannel('platform-fees', 'fees-updated', {
+    clientRate: config.client_rate,
+    providerRate: config.provider_rate,
+  }).catch(() => {});
+
+// GET /api/admin/fee-config — current config + full change history.
+router.get('/fee-config', async (req, res) => {
+  try {
+    res.json({ success: true, ...(await loadFeeConfig()) });
+  } catch (err) {
+    console.error('GET /api/admin/fee-config error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load fee config.' });
+  }
+});
+
+// PATCH /api/admin/fee-config { side, rate, effective, reason } — change one side.
+router.patch('/fee-config', async (req, res) => {
+  const { side, rate, effective, reason } = req.body || {};
+  if (side !== 'client' && side !== 'provider') {
+    return res.status(400).json({ success: false, message: 'side must be "client" or "provider".' });
+  }
+  const r = parseFloat(rate);
+  if (isNaN(r) || r < 0 || r > 100) {
+    return res.status(400).json({ success: false, message: 'Rate must be between 0 and 100.' });
+  }
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ success: false, message: 'A reason is required.' });
+  }
+  if (!effective) {
+    return res.status(400).json({ success: false, message: 'An effective date is required.' });
+  }
+  try {
+    const cur = (await db.query('SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1')).rows[0];
+    const oldClient = num(cur.client_rate);
+    const oldProvider = num(cur.provider_rate);
+    const newClient = side === 'client' ? r : oldClient;
+    const newProvider = side === 'provider' ? r : oldProvider;
+
+    // side is validated to a fixed literal above — safe to interpolate the column.
+    await db.query(
+      `UPDATE public.platform_fee_config SET ${side}_rate = $1, ${side}_effective = $2, updated_at = NOW() WHERE id = 1`,
+      [r, effective]
+    );
+    await db.query(
+      `UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active' AND (type = $1 OR type = 'both')`,
+      [side]
+    );
+    await db.query(
+      `INSERT INTO public.fee_change_history
+         (code, type, old_client, old_provider, new_client, new_provider, effective, reason, changed_by, status)
+       VALUES ('FCH-' || lpad(nextval('public.fee_change_code_seq')::text, 3, '0'),
+               $1, $2, $3, $4, $5, $6, $7, $8, 'active')`,
+      [side, oldClient, oldProvider, newClient, newProvider, effective, reason.trim(), req.user.id]
+    );
+
+    const out = await loadFeeConfig();
+    res.json({ success: true, ...out });
+    broadcastFees(out.config);
+  } catch (err) {
+    console.error('PATCH /api/admin/fee-config error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update fee config.' });
+  }
+});
+
+// POST /api/admin/fee-config/rollback { client, provider } — revert the checked
+// side(s) to their previous historical value. Entries are individual per side.
+router.post('/fee-config/rollback', async (req, res) => {
+  const doClient = !!(req.body && req.body.client);
+  const doProvider = !!(req.body && req.body.provider);
+  if (!doClient && !doProvider) {
+    return res.status(400).json({ success: false, message: 'Select at least one side to roll back.' });
+  }
+  try {
+    const cur = (await db.query('SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1')).rows[0];
+    const oldClient = num(cur.client_rate);
+    const oldProvider = num(cur.provider_rate);
+    let newClient = oldClient;
+    let newProvider = oldProvider;
+
+    if (doClient) {
+      const prev = (await db.query(
+        `SELECT old_client FROM public.fee_change_history WHERE type IN ('client','both') ORDER BY created_at DESC LIMIT 1`
+      )).rows[0];
+      if (!prev) return res.status(400).json({ success: false, message: 'No previous client fee to roll back to.' });
+      newClient = num(prev.old_client);
+    }
+    if (doProvider) {
+      const prev = (await db.query(
+        `SELECT old_provider FROM public.fee_change_history WHERE type IN ('provider','both') ORDER BY created_at DESC LIMIT 1`
+      )).rows[0];
+      if (!prev) return res.status(400).json({ success: false, message: 'No previous provider fee to roll back to.' });
+      newProvider = num(prev.old_provider);
+    }
+
+    if (doClient) {
+      await db.query(`UPDATE public.platform_fee_config SET client_rate = $1, client_effective = CURRENT_DATE, updated_at = NOW() WHERE id = 1`, [newClient]);
+    }
+    if (doProvider) {
+      await db.query(`UPDATE public.platform_fee_config SET provider_rate = $1, provider_effective = CURRENT_DATE, updated_at = NOW() WHERE id = 1`, [newProvider]);
+    }
+
+    // Supersede the active entries for the rolled-back side(s).
+    if (doClient && doProvider) {
+      await db.query(`UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active'`);
+    } else {
+      const side = doClient ? 'client' : 'provider';
+      await db.query(`UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active' AND (type = $1 OR type = 'both')`, [side]);
+    }
+
+    const type = doClient && doProvider ? 'both' : doClient ? 'client' : 'provider';
+    const sidesLabel = [doClient && 'Client', doProvider && 'Provider'].filter(Boolean).join(' & ');
+    await db.query(
+      `INSERT INTO public.fee_change_history
+         (code, type, old_client, old_provider, new_client, new_provider, effective, reason, changed_by, status)
+       VALUES ('FCH-' || lpad(nextval('public.fee_change_code_seq')::text, 3, '0'),
+               $1, $2, $3, $4, $5, CURRENT_DATE, $6, $7, 'active')`,
+      [type, oldClient, oldProvider, newClient, newProvider, `Rollback (${sidesLabel})`, req.user.id]
+    );
+
+    const out = await loadFeeConfig();
+    res.json({ success: true, ...out });
+    broadcastFees(out.config);
+  } catch (err) {
+    console.error('POST /api/admin/fee-config/rollback error:', err);
+    res.status(500).json({ success: false, message: 'Failed to roll back fee config.' });
   }
 });
 
