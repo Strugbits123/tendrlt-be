@@ -57,7 +57,7 @@ const setTokenCookie = (res, userId) => {
 const sendVerificationEmail = async (email, token, firstName) => {
   const verificationUrl = `${BACKEND_URL}/api/auth/verify-email?token=${token}`;
 
-  await resend.emails.send({
+  const { error } = await resend.emails.send({
     from: `TendrIt <${process.env.RESEND_FROM_EMAIL}>`,
     to: email,
     subject: 'Verify your TendrIt account',
@@ -93,6 +93,8 @@ const sendVerificationEmail = async (email, token, firstName) => {
       </html>
     `
   });
+  // Resend returns errors instead of throwing — surface them so failures aren't silent.
+  if (error) throw new Error(`Resend verification email failed: ${error.message || JSON.stringify(error)}`);
 };
 
 /**
@@ -101,7 +103,7 @@ const sendVerificationEmail = async (email, token, firstName) => {
 const sendPasswordResetEmail = async (email, token, firstName) => {
   const resetUrl = `${FRONTEND_URL}/forgot-password?token=${token}`;
 
-  await resend.emails.send({
+  const { error } = await resend.emails.send({
     from: `TendrIt <${process.env.RESEND_FROM_EMAIL}>`,
     to: email,
     subject: 'Reset your TendrIt password',
@@ -137,6 +139,8 @@ const sendPasswordResetEmail = async (email, token, firstName) => {
       </html>
     `
   });
+  // Resend returns errors instead of throwing — surface them so failures aren't silent.
+  if (error) throw new Error(`Resend password reset email failed: ${error.message || JSON.stringify(error)}`);
 };
 
 /**

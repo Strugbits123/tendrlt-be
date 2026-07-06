@@ -1,9 +1,10 @@
 const express = require('express');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
-const { notifyUser } = require('../lib/realtimeService');
+const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendNewQuoteEmail } = require('../lib/quoteEmails');
 const { sendPushToUser } = require('../lib/pushService');
+const { detectPII } = require('../lib/piiFilter');
 
 const router = express.Router();
 
@@ -180,7 +181,7 @@ router.get('/received', authenticate, authorize('homeowner'), async (req, res) =
       JOIN public.tenders t  ON t.id  = q.tender_id
       JOIN public.users   u  ON u.id  = q.provider_id
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
-      WHERE t.client_id = $1${extra}
+      WHERE t.client_id = $1 AND t.trashed_at IS NULL${extra}
       ORDER BY q.created_at DESC
     `, params);
     res.json({ success: true, quotes: result.rows });
@@ -255,6 +256,7 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
       JOIN public.tenders t ON t.id = q.tender_id
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
       WHERE q.provider_id = $1
+        AND t.trashed_at IS NULL   -- hide quotes on admin-removed tenders (restored if the tender is restored)
       ORDER BY q.created_at DESC
     `, [req.user.id]);
 
@@ -309,6 +311,164 @@ router.get('/:id', authenticate, async (req, res) => {
   } catch (err) {
     console.error('GET /api/quotes/:id error:', err);
     res.status(500).json({ success: false, message: 'Failed to load quote.' });
+  }
+});
+
+// ============================================================
+// CHAT — messages scoped to a quote (provider ↔ tender owner)
+// ============================================================
+
+/**
+ * Load a quote with the data needed to authorize chat, and resolve which user
+ * is "me" and which is the "other" party. Returns null if the quote is missing
+ * or the requester is not one of the two parties.
+ */
+async function loadChatContext(quoteId, reqUser) {
+  const result = await db.query(`
+    SELECT
+      q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
+      q.status, q.provider_id,
+      u.first_name AS provider_first_name,
+      u.last_name  AS provider_last_name,
+      st.display_name AS tender_title,
+      st.emoji        AS tender_emoji,
+      t.client_id,
+      cu.first_name   AS client_first_name,
+      cu.last_name    AS client_last_name
+    FROM public.quotes q
+    JOIN public.tenders t ON t.id = q.tender_id
+    JOIN public.users   u ON u.id = q.provider_id
+    JOIN public.users   cu ON cu.id = t.client_id
+    LEFT JOIN public.service_types st ON st.id = t.service_type_id
+    WHERE q.id = $1
+  `, [quoteId]);
+
+  if (result.rows.length === 0) return { notFound: true };
+
+  const row = result.rows[0];
+  const isHomeowner = reqUser.role === 'homeowner' && row.client_id === reqUser.id;
+  const isProvider  = reqUser.role === 'provider'  && row.provider_id === reqUser.id;
+  if (!isHomeowner && !isProvider) return { forbidden: true };
+
+  const otherUserId = isProvider ? row.client_id : row.provider_id;
+  const otherName = isProvider
+    ? `${row.client_first_name} ${row.client_last_name}`.trim()
+    : `${row.provider_first_name} ${row.provider_last_name}`.trim();
+
+  return { row, isProvider, otherUserId, otherName };
+}
+
+// GET /api/quotes/:id/messages — full conversation + header; marks incoming read.
+router.get('/:id/messages', authenticate, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const ctx = await loadChatContext(id, req.user);
+    if (ctx.notFound)  return res.status(404).json({ success: false, message: 'Quote not found.' });
+    if (ctx.forbidden) return res.status(403).json({ success: false, message: 'Forbidden.' });
+
+    const messages = await db.queryAsUser(req.user.id, `
+      SELECT id, quote_id, sender_id, recipient_id, body, read, created_at
+      FROM public.messages
+      WHERE quote_id = $1
+      ORDER BY created_at ASC
+    `, [id]);
+
+    // Mark messages addressed to me as read (best-effort).
+    db.queryAsUser(req.user.id, `
+      UPDATE public.messages SET read = true
+      WHERE quote_id = $1 AND recipient_id = $2 AND read = false
+    `, [id, req.user.id]).catch(() => {});
+
+    const { row } = ctx;
+    res.json({
+      success: true,
+      messages: messages.rows,
+      meId: req.user.id,
+      quote: {
+        id: row.id,
+        tender_id: row.tender_id,
+        amount: row.amount,
+        timeline: row.timeline,
+        preferred_start_date: row.preferred_start_date,
+        status: row.status,
+        tender_title: row.tender_title,
+        tender_emoji: row.tender_emoji,
+        other_name: ctx.otherName,
+        other_role: ctx.isProvider ? 'homeowner' : 'provider',
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/quotes/:id/messages error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load messages.' });
+  }
+});
+
+// POST /api/quotes/:id/messages { body } — send a message (PII-blocked).
+router.post('/:id/messages', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
+
+  if (!body) {
+    return res.status(400).json({ success: false, message: 'Message cannot be empty.' });
+  }
+  if (body.length > 2000) {
+    return res.status(400).json({ success: false, message: 'Message is too long (max 2000 characters).' });
+  }
+
+  // Server-authoritative PII / off-platform block.
+  const pii = detectPII(body);
+  if (pii.blocked) {
+    return res.status(422).json({
+      success: false,
+      code: 'PII_BLOCKED',
+      label: pii.label,
+      message: `For your safety, sharing a ${pii.label} is not allowed. Keep the conversation on TendrIt.`,
+    });
+  }
+
+  try {
+    const ctx = await loadChatContext(id, req.user);
+    if (ctx.notFound)  return res.status(404).json({ success: false, message: 'Quote not found.' });
+    if (ctx.forbidden) return res.status(403).json({ success: false, message: 'Forbidden.' });
+
+    const inserted = await db.queryAsUser(req.user.id, `
+      INSERT INTO public.messages (quote_id, sender_id, recipient_id, body)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, quote_id, sender_id, recipient_id, body, read, created_at
+    `, [id, req.user.id, ctx.otherUserId, body]);
+
+    const message = inserted.rows[0];
+    res.status(201).json({ success: true, message });
+
+    // ── Fire-and-forget fan-out ──────────────────────────────────
+    const senderName = `${req.user.first_name} ${req.user.last_name}`.trim();
+    const preview = body.length > 120 ? `${body.slice(0, 117)}…` : body;
+
+    // 1. Broadcast to the per-quote channel → both open chat windows update live
+    notifyChannel(`quote-chat-${id}`, 'message', { message }).catch(() => {});
+    // 2. Directed event → recipient's bell/toast when they're not in the chat
+    notifyUser(ctx.otherUserId, 'chat-message', { quoteId: id, messageId: message.id }).catch(() => {});
+    // 3. Persistent notification row
+    db.query(`
+      INSERT INTO public.notifications (user_id, type, title, body, data)
+      VALUES ($1, 'new_message', $2, $3, $4::jsonb)
+    `, [
+      ctx.otherUserId,
+      `New message from ${senderName}`,
+      preview,
+      JSON.stringify({ quoteId: id }),
+    ]).catch(err => console.warn('[chat] notification insert error:', err.message));
+    // 4. Web push
+    sendPushToUser(ctx.otherUserId, {
+      title: `New message from ${senderName} 💬`,
+      body: preview,
+      url: `/chat?quoteId=${id}`,
+      type: 'new_message',
+      data: { quoteId: id },
+    }).catch(() => {});
+  } catch (err) {
+    console.error('POST /api/quotes/:id/messages error:', err);
+    res.status(500).json({ success: false, message: 'Failed to send message.' });
   }
 });
 

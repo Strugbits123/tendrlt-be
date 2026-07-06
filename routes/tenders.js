@@ -22,6 +22,9 @@ const supabase = createClient(
 
 const VALID_URGENCIES = ['emergency', 'urgent', 'soon', 'flexible', 'planning'];
 const VALID_STATUSES  = ['draft', 'open'];
+// Homeowner-chosen lifespan for a published tender. After this many days from
+// publish, expires_at passes and the tender drops out of browse/explore.
+const ALLOWED_EXPIRY_DAYS = [7, 14, 30, 60, 90];
 
 // Fields that can be patched on a tender
 const PATCHABLE = [
@@ -132,12 +135,20 @@ router.post('/',
       category, parish, description, urgency, urgency_note,
       preferred_start_date, budget_min, budget_max,
       contact_name, contact_phone, contact_email,
-      location_lat, location_lng,
+      location_lat, location_lng, expiry_days,
       status = 'draft',
     } = req.body;
 
     if (!VALID_STATUSES.includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status.' });
+    }
+
+    const expiryDaysVal =
+      expiry_days !== undefined && expiry_days !== '' && expiry_days !== null
+        ? parseInt(expiry_days, 10)
+        : null;
+    if (expiryDaysVal !== null && !ALLOWED_EXPIRY_DAYS.includes(expiryDaysVal)) {
+      return res.status(400).json({ success: false, message: 'Invalid expiry period.' });
     }
 
     // category and parish are DB NOT NULL — required for both draft and open
@@ -151,6 +162,12 @@ router.post('/',
         return res.status(400).json({
           success: false,
           message: 'urgency, contact_name, and contact_phone are required to publish a tender.',
+        });
+      }
+      if (!expiryDaysVal) {
+        return res.status(400).json({
+          success: false,
+          message: 'An expiry period (7, 14, 30, 60, or 90 days) is required to publish a tender.',
         });
       }
       if (!VALID_URGENCIES.includes(urgency)) {
@@ -176,7 +193,7 @@ router.post('/',
           preferred_start_date, budget_min, budget_max,
           contact_name, contact_phone, contact_email,
           location_lat, location_lng, status,
-          terms_accepted_at
+          expiry_days, terms_accepted_at, expires_at
         )
         SELECT
           $1, $2::service_category, st.id, $3,
@@ -184,7 +201,10 @@ router.post('/',
           $7::date, $8, $9,
           $10, $11, $12,
           $13, $14, $15::tender_status,
-          CASE WHEN $15::tender_status = 'open' THEN NOW() ELSE NULL END
+          $16::smallint,
+          CASE WHEN $15::tender_status = 'open' THEN NOW() ELSE NULL END,
+          CASE WHEN $15::tender_status = 'open' AND $16 IS NOT NULL
+               THEN NOW() + ($16::int * INTERVAL '1 day') ELSE NULL END
         FROM public.service_types st
         WHERE st.slug = $2::text
         RETURNING *
@@ -204,6 +224,7 @@ router.post('/',
         lat,
         lng,
         status,
+        expiryDaysVal,
       ]);
 
       if (insertResult.rows.length === 0) {
@@ -289,11 +310,19 @@ router.patch('/:id',
     let currentStatus;
     try {
       const guard = await db.queryAsUserBatch(req.user.id, [
-        { text: `SELECT status FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
+        { text: `SELECT status, trashed_at FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
         { text: `SELECT COUNT(*)::int AS n FROM public.quotes WHERE tender_id = $1`, params: [id] },
       ]);
       if (guard[0].rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Tender not found.' });
+      }
+      // A tender removed by an admin is read-only for the homeowner.
+      if (guard[0].rows[0].trashed_at) {
+        return res.status(409).json({
+          success: false,
+          code: 'TENDER_REMOVED',
+          message: 'This tender was removed by an administrator and can no longer be edited.',
+        });
       }
       currentStatus = guard[0].rows[0].status;
       const quoteCount = guard[1].rows[0].n;
@@ -309,6 +338,15 @@ router.patch('/:id',
       return res.status(500).json({ success: false, message: 'Failed to update tender.' });
     }
 
+    // Normalise + validate the (optional) expiry period.
+    const expiryDaysVal =
+      req.body.expiry_days !== undefined && req.body.expiry_days !== '' && req.body.expiry_days !== null
+        ? parseInt(req.body.expiry_days, 10)
+        : undefined;
+    if (expiryDaysVal !== undefined && !ALLOWED_EXPIRY_DAYS.includes(expiryDaysVal)) {
+      return res.status(400).json({ success: false, message: 'Invalid expiry period.' });
+    }
+
     // Full validation when upgrading to open
     if (status === 'open') {
       const { category, parish, urgency, contact_name, contact_phone } = req.body;
@@ -316,6 +354,12 @@ router.patch('/:id',
         return res.status(400).json({
           success: false,
           message: 'category, parish, urgency, contact_name, and contact_phone are required to publish.',
+        });
+      }
+      if (!expiryDaysVal) {
+        return res.status(400).json({
+          success: false,
+          message: 'An expiry period (7, 14, 30, 60, or 90 days) is required to publish a tender.',
         });
       }
       if (!VALID_URGENCIES.includes(urgency)) {
@@ -380,6 +424,22 @@ router.patch('/:id',
       if (status === 'open') {
         setClauses.push(`terms_accepted_at = NOW()`);
       }
+    }
+
+    // Persist the chosen expiry period.
+    if (expiryDaysVal !== undefined) {
+      setClauses.push(`expiry_days = $${paramIdx}::smallint`);
+      params.push(expiryDaysVal);
+      paramIdx++;
+    }
+    // (Re)start the expiry countdown from NOW whenever the tender is/goes open
+    // and we have a period to apply. Editing an open tender is only permitted
+    // with zero quotes, so restarting the clock here is safe.
+    const willBeOpen = status === 'open' || (status === undefined && currentStatus === 'open');
+    if (willBeOpen && expiryDaysVal !== undefined) {
+      setClauses.push(`expires_at = NOW() + ($${paramIdx}::int * INTERVAL '1 day')`);
+      params.push(expiryDaysVal);
+      paramIdx++;
     }
 
     // Handle category change (requires re-joining service_types for service_type_id)
@@ -503,9 +563,10 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
   try {
     const result = await db.queryAsUser(req.user.id, `
       SELECT
-        t.id, t.status, t.category, t.parish, t.description,
+        t.id, t.display_code, t.status, t.category, t.parish, t.description,
         t.urgency, t.budget_min, t.budget_max, t.created_at,
-        t.quotes_count, t.photos_count,
+        t.quotes_count, t.photos_count, t.expires_at,
+        t.trashed_at, t.trashed_reason,
         (
           SELECT MIN(q.amount) FROM public.quotes q
           WHERE q.tender_id = t.id
@@ -543,7 +604,8 @@ router.get('/browse', authenticate, authorize('provider'), async (req, res) => {
   const PAGE_SIZE  = 20;
   const rowOffset  = Math.max(0, parseInt(offset, 10) || 0);
   const params = [req.user.id];
-  const conditions = ["t.status = 'open'"];
+  // Live, non-expired, non-trashed tenders only.
+  const conditions = ["t.status = 'open'", "t.trashed_at IS NULL", "(t.expires_at IS NULL OR t.expires_at > NOW())"];
   let paramIdx = 2;
 
   if (category) {
@@ -603,9 +665,9 @@ router.get('/browse', authenticate, authorize('provider'), async (req, res) => {
   try {
     const result = await db.queryAsUser(req.user.id, `
       SELECT
-        t.id, t.category, t.parish, t.description, t.urgency,
+        t.id, t.display_code, t.category, t.parish, t.description, t.urgency,
         t.budget_min, t.budget_max, t.created_at, t.quotes_count,
-        t.photos_count, t.preferred_start_date,
+        t.photos_count, t.preferred_start_date, t.expires_at,
         EXISTS (
           SELECT 1 FROM public.quotes q
           WHERE q.tender_id = t.id AND q.provider_id = $1
@@ -641,9 +703,9 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
       {
         text: `
           SELECT
-            t.id, t.category, t.parish, t.description, t.urgency, t.urgency_note,
+            t.id, t.display_code, t.category, t.parish, t.description, t.urgency, t.urgency_note,
             t.budget_min, t.budget_max, t.created_at, t.quotes_count,
-            t.photos_count, t.preferred_start_date, t.status,
+            t.photos_count, t.preferred_start_date, t.status, t.expires_at,
             CASE WHEN EXISTS (
               SELECT 1 FROM public.quotes q
               WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
@@ -686,6 +748,7 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
           FROM public.tenders t
           LEFT JOIN public.service_types st ON st.id = t.service_type_id
           WHERE t.id = $1 AND t.status = 'open'
+            AND t.trashed_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())
         `,
         params: [id, req.user.id],
       },
@@ -739,7 +802,8 @@ router.get('/public', async (req, res) => {
   const PAGE_SIZE = 20;
   const rowOffset = Math.max(0, parseInt(offset, 10) || 0);
   const params = [];
-  const conditions = ["t.status = 'open'"];
+  // Live, non-expired, non-trashed tenders only.
+  const conditions = ["t.status = 'open'", "t.trashed_at IS NULL", "(t.expires_at IS NULL OR t.expires_at > NOW())"];
   let paramIdx = 1;
 
   // UI "status" filter: only-open tenders are ever returned, so this narrows by
@@ -803,9 +867,9 @@ router.get('/public', async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
-        t.id, t.category, t.parish, t.description, t.urgency,
+        t.id, t.display_code, t.category, t.parish, t.description, t.urgency,
         t.budget_min, t.budget_max, t.created_at, t.quotes_count,
-        t.photos_count, t.preferred_start_date,
+        t.photos_count, t.preferred_start_date, t.expires_at,
         COUNT(*) OVER() AS total_count,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
@@ -840,12 +904,12 @@ router.get('/public/stats', async (req, res) => {
           COUNT(DISTINCT parish)::int                                           AS parish_count,
           COUNT(DISTINCT category)::int                                         AS category_count
         FROM public.tenders
-        WHERE status = 'open'
+        WHERE status = 'open' AND trashed_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
       `),
       db.query(`
         SELECT category, COUNT(*)::int AS count
         FROM public.tenders
-        WHERE status = 'open'
+        WHERE status = 'open' AND trashed_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
         GROUP BY category
       `),
     ]);
@@ -873,9 +937,9 @@ router.get('/public/:id', async (req, res) => {
     const [tenderResult, photosResult] = await Promise.all([
       db.query(`
         SELECT
-          t.id, t.category, t.parish, t.description, t.urgency, t.urgency_note,
+          t.id, t.display_code, t.category, t.parish, t.description, t.urgency, t.urgency_note,
           t.budget_min, t.budget_max, t.created_at, t.quotes_count,
-          t.photos_count, t.preferred_start_date, t.status,
+          t.photos_count, t.preferred_start_date, t.status, t.expires_at,
           (
             SELECT first_name || ' ' || LEFT(last_name, 1) || '.'
             FROM public.users WHERE id = t.client_id
@@ -889,6 +953,7 @@ router.get('/public/:id', async (req, res) => {
         FROM public.tenders t
         LEFT JOIN public.service_types st ON st.id = t.service_type_id
         WHERE t.id = $1 AND t.status = 'open'
+          AND t.trashed_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())
       `, [id]),
       db.query(`
         SELECT id, storage_path, display_order
