@@ -181,7 +181,7 @@ router.get('/received', authenticate, authorize('homeowner'), async (req, res) =
       JOIN public.tenders t  ON t.id  = q.tender_id
       JOIN public.users   u  ON u.id  = q.provider_id
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
-      WHERE t.client_id = $1${extra}
+      WHERE t.client_id = $1 AND t.trashed_at IS NULL${extra}
       ORDER BY q.created_at DESC
     `, params);
     res.json({ success: true, quotes: result.rows });
@@ -256,6 +256,7 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
       JOIN public.tenders t ON t.id = q.tender_id
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
       WHERE q.provider_id = $1
+        AND t.trashed_at IS NULL   -- hide quotes on admin-removed tenders (restored if the tender is restored)
       ORDER BY q.created_at DESC
     `, [req.user.id]);
 

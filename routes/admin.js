@@ -8,6 +8,7 @@ const {
   sendProviderRejectedEmail,
 } = require('../lib/verificationEmails');
 const { notifyUser } = require('../lib/realtimeService');
+const { sendTenderRemovedEmail } = require('../lib/tenderEmails');
 
 const router = express.Router();
 
@@ -355,6 +356,15 @@ const monthYear = (d) =>
   d ? new Date(d).toLocaleString('en-US', { month: 'short', year: 'numeric' }) : '';
 const isoDate = (d) => (d ? new Date(d).toISOString().slice(0, 10) : undefined);
 
+// Ping every provider who quoted a tender so their "My Quotes" list re-fetches
+// (their quote is hidden while the tender is trashed, and returns on restore).
+async function notifyQuoteProviders(tenderId) {
+  const r = await db.query('SELECT DISTINCT provider_id FROM public.quotes WHERE tender_id = $1', [tenderId]);
+  await Promise.allSettled(
+    r.rows.map((row) => notifyUser(row.provider_id, 'quotes-updated', { tenderId }))
+  );
+}
+
 // GET /api/admin/tenders — every non-draft tender in the AdminTender shape.
 router.get('/tenders', async (req, res) => {
   try {
@@ -437,32 +447,88 @@ router.get('/tenders', async (req, res) => {
   }
 });
 
-// POST /api/admin/tenders/:code/trash — soft-delete (hides from browse/explore).
+// POST /api/admin/tenders/:code/trash — soft-delete (hides from browse/explore
+// and marks the homeowner's copy "Rejected by admin"). Optional { reason }.
 router.post('/tenders/:code/trash', async (req, res) => {
+  const reason = (req.body && typeof req.body.reason === 'string')
+    ? req.body.reason.trim().slice(0, 500) || null
+    : null;
   try {
     const r = await db.query(
-      `UPDATE public.tenders SET trashed_at = NOW(), updated_at = NOW()
-       WHERE display_code = $1 RETURNING id`,
-      [req.params.code]
+      `UPDATE public.tenders
+         SET trashed_at = NOW(), trashed_reason = $2, updated_at = NOW()
+       WHERE display_code = $1
+       RETURNING id, client_id, display_code,
+                 (SELECT display_name FROM public.service_types WHERE id = service_type_id) AS service_name,
+                 category,
+                 (SELECT email      FROM public.users WHERE id = client_id) AS client_email,
+                 (SELECT first_name FROM public.users WHERE id = client_id) AS client_name`,
+      [req.params.code, reason]
     );
     if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Tender not found.' });
     res.json({ success: true });
+
+    // Fire-and-forget: tell the homeowner their tender was removed.
+    const t = r.rows[0];
+    const label = t.service_name || t.category || 'your tender';
+    Promise.allSettled([
+      notifyUser(t.client_id, 'tender-removed', { tenderId: t.id, displayCode: t.display_code, reason }),
+      // Email the homeowner.
+      t.client_email
+        ? sendTenderRemovedEmail(t.client_email, { clientName: t.client_name, tenderTitle: label, tenderCode: t.display_code, reason })
+        : Promise.resolve(),
+      notifyUser(t.client_id, 'tenders-updated', { tenderId: t.id }),
+      db.query(
+        `INSERT INTO public.notifications (user_id, type, title, body, data)
+         VALUES ($1, 'tender_removed', $2, $3, $4::jsonb)`,
+        [
+          t.client_id,
+          'Your tender was removed',
+          `An administrator removed your "${label}" tender (${t.display_code}).` + (reason ? ` Reason: ${reason}` : ''),
+          JSON.stringify({ tenderId: t.id }),
+        ]
+      ),
+      // Refresh the My Quotes list of every provider who quoted — their quote is now hidden.
+      notifyQuoteProviders(t.id),
+    ]).catch((err) => console.warn('trash notify error:', err.message));
   } catch (err) {
     console.error('POST /api/admin/tenders/:code/trash error:', err);
     res.status(500).json({ success: false, message: 'Failed to trash tender.' });
   }
 });
 
-// POST /api/admin/tenders/:code/restore — undo soft-delete.
+// POST /api/admin/tenders/:code/restore — undo soft-delete + clear the reason.
 router.post('/tenders/:code/restore', async (req, res) => {
   try {
     const r = await db.query(
-      `UPDATE public.tenders SET trashed_at = NULL, updated_at = NOW()
-       WHERE display_code = $1 RETURNING id`,
+      `UPDATE public.tenders
+         SET trashed_at = NULL, trashed_reason = NULL, updated_at = NOW()
+       WHERE display_code = $1
+       RETURNING id, client_id, display_code,
+                 (SELECT display_name FROM public.service_types WHERE id = service_type_id) AS service_name,
+                 category`,
       [req.params.code]
     );
     if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Tender not found.' });
     res.json({ success: true });
+
+    const t = r.rows[0];
+    const label = t.service_name || t.category || 'your tender';
+    Promise.allSettled([
+      notifyUser(t.client_id, 'tenders-updated', { tenderId: t.id }),
+      db.query(
+        `INSERT INTO public.notifications (user_id, type, title, body, data)
+         VALUES ($1, 'tender_restored', $2, $3, $4::jsonb)`,
+        [
+          t.client_id,
+          'Your tender was restored',
+          `An administrator restored your "${label}" tender (${t.display_code}). It is live again.`,
+          JSON.stringify({ tenderId: t.id }),
+        ]
+      ),
+      // Refresh My Quotes for providers who quoted — their quote is visible again.
+      notifyQuoteProviders(t.id),
+    ]).catch((err) => console.warn('restore notify error:', err.message));
   } catch (err) {
     console.error('POST /api/admin/tenders/:code/restore error:', err);
     res.status(500).json({ success: false, message: 'Failed to restore tender.' });

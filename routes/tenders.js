@@ -310,11 +310,19 @@ router.patch('/:id',
     let currentStatus;
     try {
       const guard = await db.queryAsUserBatch(req.user.id, [
-        { text: `SELECT status FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
+        { text: `SELECT status, trashed_at FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
         { text: `SELECT COUNT(*)::int AS n FROM public.quotes WHERE tender_id = $1`, params: [id] },
       ]);
       if (guard[0].rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Tender not found.' });
+      }
+      // A tender removed by an admin is read-only for the homeowner.
+      if (guard[0].rows[0].trashed_at) {
+        return res.status(409).json({
+          success: false,
+          code: 'TENDER_REMOVED',
+          message: 'This tender was removed by an administrator and can no longer be edited.',
+        });
       }
       currentStatus = guard[0].rows[0].status;
       const quoteCount = guard[1].rows[0].n;
@@ -558,6 +566,7 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
         t.id, t.display_code, t.status, t.category, t.parish, t.description,
         t.urgency, t.budget_min, t.budget_max, t.created_at,
         t.quotes_count, t.photos_count, t.expires_at,
+        t.trashed_at, t.trashed_reason,
         (
           SELECT MIN(q.amount) FROM public.quotes q
           WHERE q.tender_id = t.id
