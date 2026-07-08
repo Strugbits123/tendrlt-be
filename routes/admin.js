@@ -947,4 +947,80 @@ router.post('/fee-config/rollback', async (req, res) => {
   }
 });
 
+// ============================================================
+// GET /api/admin/revenue?period=30d
+// Real platform revenue from public.transactions (recorded on quote accept —
+// WiPay deferred, status 'held'; no money moves yet). Returns money fields the
+// admin dashboard revenue widgets merge over their mock period row; activity /
+// growth metrics remain mock until separately wired.
+// See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+// ============================================================
+const REVENUE_WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 365, all: null };
+
+const compactMoney = (cents) => {
+  const d = Math.round((cents || 0) / 100);
+  if (d >= 1e6) return (d / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+  if (d >= 1e3) return Math.round(d / 1e3) + 'K';
+  return d.toLocaleString('en-US');
+};
+const fullMoney = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
+
+router.get('/revenue', async (req, res) => {
+  const period = REVENUE_WINDOWS.hasOwnProperty(req.query.period) ? req.query.period : '30d';
+  const days = REVENUE_WINDOWS[period]; // null = all-time
+  try {
+    const sums = `
+      SELECT COALESCE(SUM(amount),0)::bigint       AS gmv,
+             COALESCE(SUM(client_fee),0)::bigint   AS cfee,
+             COALESCE(SUM(provider_fee),0)::bigint AS pfee,
+             COALESCE(SUM(platform_fee),0)::bigint AS rev,
+             COUNT(*)::int                          AS done
+      FROM public.transactions`;
+
+    const current = await db.query(
+      `${sums} WHERE ($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`,
+      [days]
+    );
+    const c = current.rows[0];
+
+    // Delta vs the immediately preceding window of equal length (skip for all-time).
+    let deltaRev = '—';
+    if (days !== null) {
+      const prev = await db.query(
+        `${sums} WHERE created_at >= NOW() - (INTERVAL '1 day' * $1 * 2)
+                   AND created_at <  NOW() - (INTERVAL '1 day' * $1)`,
+        [days]
+      );
+      const prevRev = Number(prev.rows[0].rev);
+      const curRev = Number(c.rev);
+      if (prevRev > 0) {
+        const pct = ((curRev - prevRev) / prevRev) * 100;
+        deltaRev = `${pct >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(1)}%`;
+      } else if (curRev > 0) {
+        deltaRev = '↑ new';
+      }
+    }
+
+    const done = c.done || 0;
+    res.json({
+      success: true,
+      revenue: {
+        rev: compactMoney(c.rev),
+        cfee: compactMoney(c.cfee),
+        pfee: compactMoney(c.pfee),
+        gmv: compactMoney(c.gmv),
+        done,
+        delta_rev: deltaRev,
+        fee_clients: fullMoney(c.cfee),
+        fee_provs: fullMoney(c.pfee),
+        fee_per_job: done ? 'J$' + fullMoney(Number(c.rev) / done) : 'J$0',
+        avg_gmv: done ? 'J$' + fullMoney(Number(c.gmv) / done) : 'J$0',
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/admin/revenue error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load revenue.' });
+  }
+});
+
 module.exports = router;

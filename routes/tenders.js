@@ -722,6 +722,10 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
               SELECT 1 FROM public.quotes q
               WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
             ) THEN t.contact_phone ELSE NULL END AS contact_phone,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
+            ) THEN t.contact_email ELSE NULL END AS contact_email,
             EXISTS (
               SELECT 1 FROM public.quotes q
               WHERE q.tender_id = t.id AND q.provider_id = $2
@@ -747,8 +751,18 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
             st.emoji        AS service_emoji
           FROM public.tenders t
           LEFT JOIN public.service_types st ON st.id = t.service_type_id
-          WHERE t.id = $1 AND t.status = 'open'
-            AND t.trashed_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())
+          WHERE t.id = $1 AND t.trashed_at IS NULL
+            AND (
+              -- Open & live for any provider to view/quote…
+              (t.status = 'open' AND (t.expires_at IS NULL OR t.expires_at > NOW()))
+              -- …or a provider who already quoted can still open it after it
+              -- leaves 'open' (awarded/in-progress) — the winner sees revealed
+              -- contact + location; losers see the read-only "not selected" view.
+              OR EXISTS (
+                SELECT 1 FROM public.quotes q
+                WHERE q.tender_id = t.id AND q.provider_id = $2
+              )
+            )
         `,
         params: [id, req.user.id],
       },

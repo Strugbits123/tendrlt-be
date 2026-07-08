@@ -394,6 +394,96 @@ router.get('/stats', authenticate, authorize('provider'), async (req, res) => {
 });
 
 // ============================================================
+// GET /api/providers/earnings
+// Real earnings for the provider, sourced from public.transactions
+// (created when a homeowner accepts a quote — WiPay deferred, status 'held').
+// All amounts are JMD cents. Uses the superuser pool so we can join the
+// homeowner's (masked) name; strictly filtered by provider_id = the caller.
+// See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+// ============================================================
+router.get('/earnings', authenticate, authorize('provider'), async (req, res) => {
+  try {
+    const uid = req.user.id;
+
+    const agg = await db.query(`
+      SELECT
+        -- This month
+        COALESCE(SUM(amount)          FILTER (WHERE created_at >= date_trunc('month', NOW())), 0)::int AS gross_month,
+        COALESCE(SUM(provider_fee)    FILTER (WHERE created_at >= date_trunc('month', NOW())), 0)::int AS fee_month,
+        COALESCE(SUM(provider_payout) FILTER (WHERE created_at >= date_trunc('month', NOW())), 0)::int AS net_month,
+        COUNT(*)                      FILTER (WHERE created_at >= date_trunc('month', NOW()))::int      AS jobs_month,
+        -- Last 3 months
+        COALESCE(SUM(amount)          FILTER (WHERE created_at >= NOW() - INTERVAL '3 months'), 0)::int AS gross_last3,
+        COALESCE(SUM(provider_fee)    FILTER (WHERE created_at >= NOW() - INTERVAL '3 months'), 0)::int AS fee_last3,
+        COALESCE(SUM(provider_payout) FILTER (WHERE created_at >= NOW() - INTERVAL '3 months'), 0)::int AS net_last3,
+        COUNT(*)                      FILTER (WHERE created_at >= NOW() - INTERVAL '3 months')::int      AS jobs_last3,
+        -- This year
+        COALESCE(SUM(amount)          FILTER (WHERE created_at >= date_trunc('year', NOW())), 0)::int  AS gross_year,
+        COALESCE(SUM(provider_fee)    FILTER (WHERE created_at >= date_trunc('year', NOW())), 0)::int  AS fee_year,
+        COALESCE(SUM(provider_payout) FILTER (WHERE created_at >= date_trunc('year', NOW())), 0)::int  AS net_year,
+        COUNT(*)                      FILTER (WHERE created_at >= date_trunc('year', NOW()))::int       AS jobs_year,
+        -- All time
+        COALESCE(SUM(amount), 0)::int          AS gross_all,
+        COALESCE(SUM(provider_fee), 0)::int    AS fee_all,
+        COALESCE(SUM(provider_payout), 0)::int AS net_all,
+        COUNT(*)::int                          AS jobs_all
+      FROM public.transactions
+      WHERE provider_id = $1
+    `, [uid]);
+
+    const txns = await db.query(`
+      SELECT tx.id, tx.amount, tx.provider_fee, tx.provider_payout, tx.status, tx.created_at,
+             t.parish,
+             st.display_name AS service_name, st.emoji AS service_emoji,
+             (cu.first_name || ' ' || LEFT(cu.last_name, 1) || '.') AS client_name
+      FROM public.transactions tx
+      JOIN public.tenders t ON t.id = tx.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users cu ON cu.id = tx.client_id
+      WHERE tx.provider_id = $1
+      ORDER BY tx.created_at DESC
+      LIMIT 50
+    `, [uid]);
+
+    const ratingResult = await db.query(
+      `SELECT ROUND(AVG(rating)::numeric, 1) AS avg_rating, COUNT(*)::int AS review_count
+       FROM public.reviews WHERE provider_id = $1`,
+      [uid]
+    );
+
+    const a = agg.rows[0];
+    const mk = (g, f, n, j) => ({ grossCents: g, feeCents: f, netCents: n, jobs: j });
+
+    res.json({
+      success: true,
+      periods: {
+        month: mk(a.gross_month, a.fee_month, a.net_month, a.jobs_month),
+        last3: mk(a.gross_last3, a.fee_last3, a.net_last3, a.jobs_last3),
+        year:  mk(a.gross_year,  a.fee_year,  a.net_year,  a.jobs_year),
+        all:   mk(a.gross_all,   a.fee_all,   a.net_all,   a.jobs_all),
+      },
+      avgRating:   ratingResult.rows[0].avg_rating ? parseFloat(ratingResult.rows[0].avg_rating) : null,
+      reviewCount: ratingResult.rows[0].review_count ?? 0,
+      transactions: txns.rows.map((t) => ({
+        id: t.id,
+        job: t.service_name || 'Job',
+        emoji: t.service_emoji || '🛠',
+        clientName: t.client_name,
+        parish: t.parish,
+        date: t.created_at,
+        status: t.status,                 // 'held' | 'payout_queued' | 'completed' | ...
+        amountCents: t.amount,
+        payoutCents: t.provider_payout,
+        feeCents: t.provider_fee,
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/providers/earnings error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load earnings.' });
+  }
+});
+
+// ============================================================
 // POST /api/providers/go-live
 // Sets is_onboarding_complete = TRUE on the provider's profile.
 // Only succeeds if a profile row already exists (step 1 must be saved first).

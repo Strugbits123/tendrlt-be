@@ -2,7 +2,7 @@ const express = require('express');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { notifyUser, notifyChannel } = require('../lib/realtimeService');
-const { sendNewQuoteEmail } = require('../lib/quoteEmails');
+const { sendNewQuoteEmail, sendQuoteAcceptedEmail } = require('../lib/quoteEmails');
 const { sendPushToUser } = require('../lib/pushService');
 const { detectPII } = require('../lib/piiFilter');
 
@@ -199,10 +199,18 @@ router.get('/received', authenticate, authorize('homeowner'), async (req, res) =
 router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, res) => {
   const { id } = req.params;
   try {
+    // Superuser query (bypasses RLS) so we can read the winning provider's
+    // contact + the quote amount + service name in one shot.
     const check = await db.query(`
-      SELECT q.id, q.tender_id, q.provider_id, t.client_id
+      SELECT q.id, q.tender_id, q.provider_id, q.amount, q.status AS quote_status,
+             t.client_id,
+             st.display_name AS service_name,
+             pr.email AS provider_email,
+             (pr.first_name || ' ' || pr.last_name) AS provider_name
       FROM public.quotes q
       JOIN public.tenders t ON t.id = q.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users pr ON pr.id = q.provider_id
       WHERE q.id = $1
     `, [id]);
 
@@ -226,13 +234,78 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
       [id]
     );
 
+    // ── Real-world workflow starts here (WiPay deferred) ──────────────────
+    // 1. Record a real transaction so payment/revenue numbers become live.
+    //    No money moves yet — status 'held' (escrow-held) until WiPay exists.
+    //    Fees come from the current live config (two-sided: client fee added on
+    //    top, provider fee deducted from payout). See
+    //    documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+    const cfg = await db.query(
+      `SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1`
+    );
+    const clientRate   = parseFloat(cfg.rows[0]?.client_rate)   || 9.5;
+    const providerRate = parseFloat(cfg.rows[0]?.provider_rate) || 12;
+    const amount       = row.amount;                              // JMD cents
+    const clientFee    = Math.round((amount * clientRate) / 100);
+    const providerFee  = Math.round((amount * providerRate) / 100);
+    const providerPayout = amount - providerFee;
+    const platformFee    = clientFee + providerFee;
+
+    await db.query(
+      `INSERT INTO public.transactions
+         (quote_id, tender_id, client_id, provider_id, amount,
+          client_fee, provider_fee, client_fee_rate, provider_fee_rate,
+          platform_fee, provider_payout, status, collected_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'held',NOW())
+       ON CONFLICT (quote_id) DO NOTHING`,
+      [id, row.tender_id, row.client_id, row.provider_id, amount,
+       clientFee, providerFee, clientRate, providerRate,
+       platformFee, providerPayout]
+    );
+
+    // 2. Move the tender into the active/in-progress workflow. This also hides
+    //    it from other providers' browse (which filters status = 'open').
+    await db.query(
+      `UPDATE public.tenders SET status = 'in_progress', updated_at = NOW() WHERE id = $1`,
+      [row.tender_id]
+    );
+
     res.json({ success: true });
 
-    // Realtime fan-out — winner first, then each losing provider.
-    notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }).catch(() => {});
-    for (const r of rejected.rows) {
-      notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id }).catch(() => {});
-    }
+    // ── Fire-and-forget fan-out ───────────────────────────────────────────
+    const serviceName = row.service_name || 'your job';
+    const winnerTitle  = 'Your quote was accepted 🎉';
+    const winnerBody   = `${serviceName} — the job is starting. Open the tender for the homeowner's contact details & location.`;
+
+    Promise.allSettled([
+      // Winner realtime event (existing behaviour — drives toast + My Quotes).
+      notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }),
+      // Winner persistent bell notification.
+      db.query(`
+        INSERT INTO public.notifications (user_id, type, title, body, data)
+        VALUES ($1, 'quote_accepted', $2, $3, $4::jsonb)
+      `, [row.provider_id, winnerTitle, winnerBody, JSON.stringify({ tenderId: row.tender_id })]),
+      // Winner email.
+      sendQuoteAcceptedEmail(row.provider_email, {
+        providerName: row.provider_name || 'there',
+        tenderTitle: serviceName,
+        amount,
+      }),
+      // Winner web push → deep-links to the tender detail (SW 'view_job' action).
+      sendPushToUser(row.provider_id, {
+        title: winnerTitle,
+        body: winnerBody,
+        type: 'quote_accepted',
+        url: `/tender/${row.tender_id}`,
+        data: { tender_id: row.tender_id },
+      }),
+      // Losing providers: realtime only (no email/push/bell, per product decision).
+      ...rejected.rows.map((r) =>
+        notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id })
+      ),
+    ]).catch((err) => {
+      console.warn('PATCH /api/quotes/:id/accept — side-effect error:', err.message);
+    });
   } catch (err) {
     console.error('PATCH /api/quotes/:id/accept error:', err);
     res.status(500).json({ success: false, message: 'Failed to accept quote.' });
