@@ -599,6 +599,175 @@ router.delete('/tenders/:code/quotes/:pid', async (req, res) => {
 });
 
 // ============================================================
+// Admin Contact Inbox
+// Reads/writes public.contact_messages. The public form stores the subject
+// as the exact <option> label text (see tendrlt-fe/app/contact/page.tsx);
+// we map that + the homeowner/provider/other role onto the admin UI's enums.
+// ============================================================
+
+const CONTACT_ROLE_MAP = { homeowner: 'client', provider: 'provider' };
+const toContactRole = (r) => CONTACT_ROLE_MAP[r] || 'other';
+
+const CONTACT_SUBJECT_MAP = {
+  'Problem with a quote': 'quote',
+  'Payment or escrow issue': 'payment',
+  'Provider verification': 'verification',
+  'Account access': 'account',
+  'Report a user': 'report',
+  'Feature request': 'feature',
+  'General question': 'question',
+  'Other': 'other',
+};
+const toContactSubject = (s) => CONTACT_SUBJECT_MAP[s] || 'other';
+
+const INBOX_STATUSES = ['new', 'read', 'resolved', 'archived'];
+
+const shapeContactMessage = (r) => ({
+  id: r.id,
+  fn: r.first_name,
+  ln: r.last_name || '',
+  email: r.email,
+  role: toContactRole(r.role),
+  subject: toContactSubject(r.subject),
+  msg: r.message,
+  date: r.created_at.toISOString().slice(0, 10),
+  status: r.status,
+  trashed: r.trashed,
+});
+
+// GET /api/admin/contact-messages
+router.get('/contact-messages', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT id, first_name, last_name, email, role, subject, message, status, trashed, created_at
+      FROM public.contact_messages
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, items: r.rows.map(shapeContactMessage) });
+  } catch (err) {
+    console.error('GET /api/admin/contact-messages error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load contact messages.' });
+  }
+});
+
+// PATCH /api/admin/contact-messages/:id/status   body: { status }
+router.patch('/contact-messages/:id/status', async (req, res) => {
+  const { status } = req.body || {};
+  if (!INBOX_STATUSES.includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid status.' });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.contact_messages SET status = $2 WHERE id = $1 RETURNING id`,
+      [req.params.id, status]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/admin/contact-messages/:id/status error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update status.' });
+  }
+});
+
+// POST /api/admin/contact-messages/:id/trash
+router.post('/contact-messages/:id/trash', async (req, res) => {
+  try {
+    const r = await db.query(
+      `UPDATE public.contact_messages SET trashed = true WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/admin/contact-messages/:id/trash error:', err);
+    res.status(500).json({ success: false, message: 'Failed to trash message.' });
+  }
+});
+
+// POST /api/admin/contact-messages/:id/restore
+router.post('/contact-messages/:id/restore', async (req, res) => {
+  try {
+    const r = await db.query(
+      `UPDATE public.contact_messages SET trashed = false WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/admin/contact-messages/:id/restore error:', err);
+    res.status(500).json({ success: false, message: 'Failed to restore message.' });
+  }
+});
+
+// DELETE /api/admin/contact-messages/:id
+router.delete('/contact-messages/:id', async (req, res) => {
+  try {
+    const r = await db.query(`DELETE FROM public.contact_messages WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/admin/contact-messages/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete message.' });
+  }
+});
+
+// ============================================================
+// Admin Feedback Inbox
+// Reads/writes public.feedback_submissions. The public form only ever sends
+// role in {client, provider, visitor, other} and never collects a subject.
+// ============================================================
+
+const FEEDBACK_ROLE_MAP = { client: 'client', provider: 'provider', visitor: 'visitor' };
+const toFeedbackRole = (r) => FEEDBACK_ROLE_MAP[r] || 'other';
+
+const shapeFeedbackItem = (r) => ({
+  id: r.id,
+  cat: r.cat,
+  name: r.name,
+  email: r.email,
+  role: toFeedbackRole(r.role),
+  msg: r.message,
+  rating: r.rating,
+  followUp: r.follow_up,
+  date: r.created_at.toISOString().slice(0, 10),
+  status: r.status,
+});
+
+// GET /api/admin/feedback-submissions
+router.get('/feedback-submissions', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT id, cat, name, email, role, rating, follow_up, message, status, created_at
+      FROM public.feedback_submissions
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, items: r.rows.map(shapeFeedbackItem) });
+  } catch (err) {
+    console.error('GET /api/admin/feedback-submissions error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load feedback submissions.' });
+  }
+});
+
+// PATCH /api/admin/feedback-submissions/:id/status   body: { status }
+router.patch('/feedback-submissions/:id/status', async (req, res) => {
+  const { status } = req.body || {};
+  if (!INBOX_STATUSES.includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid status.' });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.feedback_submissions SET status = $2 WHERE id = $1 RETURNING id`,
+      [req.params.id, status]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Submission not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/admin/feedback-submissions/:id/status error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update status.' });
+  }
+});
+
+// ============================================================
 // Platform Fee Configuration (admin-only)
 // Reads/writes platform_fee_config (singleton) + fee_change_history (audit).
 // Every change broadcasts on 'platform-fees' so the whole app updates live.
