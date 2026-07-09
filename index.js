@@ -14,6 +14,7 @@ const notificationsRoutes = require('./routes/notifications');
 const pushRoutes          = require('./routes/push');
 const contactRoutes       = require('./routes/contact');
 const feedbackRoutes      = require('./routes/feedback');
+const feesRoutes          = require('./routes/fees');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -44,6 +45,7 @@ app.use('/api/notifications', notificationsRoutes);
 app.use('/api/push',          pushRoutes);
 app.use('/api/contact',       contactRoutes);
 app.use('/api/feedback',      feedbackRoutes);
+app.use('/api/fees',          feesRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

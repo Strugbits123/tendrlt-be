@@ -7,6 +7,8 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendNewTenderEmail } = require('../lib/tenderEmails');
 const { sendPushToUser }     = require('../lib/pushService');
+const { sendDisputeAdminEmail, sendDisputeProviderEmail } = require('../lib/disputeEmails');
+const { signedUrl, signedUrlMap, EMAIL_TTL_SECONDS } = require('../lib/storageUrls');
 
 const router = express.Router();
 
@@ -575,6 +577,15 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
           SELECT 1 FROM public.quotes q
           WHERE q.tender_id = t.id AND q.status = 'accepted'
         ) AS has_accepted_quote,
+        EXISTS (
+          SELECT 1 FROM public.transactions tx
+          JOIN public.disputes d ON d.transaction_id = tx.id
+          WHERE tx.tender_id = t.id AND d.status = 'open'
+        ) AS has_open_dispute,
+        EXISTS (
+          SELECT 1 FROM public.transactions tx
+          WHERE tx.tender_id = t.id AND tx.provider_completed_at IS NOT NULL
+        ) AS provider_marked_done,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
       FROM public.tenders t
@@ -722,6 +733,10 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
               SELECT 1 FROM public.quotes q
               WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
             ) THEN t.contact_phone ELSE NULL END AS contact_phone,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM public.quotes q
+              WHERE q.tender_id = t.id AND q.provider_id = $2 AND q.status = 'accepted'
+            ) THEN t.contact_email ELSE NULL END AS contact_email,
             EXISTS (
               SELECT 1 FROM public.quotes q
               WHERE q.tender_id = t.id AND q.provider_id = $2
@@ -747,8 +762,18 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
             st.emoji        AS service_emoji
           FROM public.tenders t
           LEFT JOIN public.service_types st ON st.id = t.service_type_id
-          WHERE t.id = $1 AND t.status = 'open'
-            AND t.trashed_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())
+          WHERE t.id = $1 AND t.trashed_at IS NULL
+            AND (
+              -- Open & live for any provider to view/quote…
+              (t.status = 'open' AND (t.expires_at IS NULL OR t.expires_at > NOW()))
+              -- …or a provider who already quoted can still open it after it
+              -- leaves 'open' (awarded/in-progress) — the winner sees revealed
+              -- contact + location; losers see the read-only "not selected" view.
+              OR EXISTS (
+                SELECT 1 FROM public.quotes q
+                WHERE q.tender_id = t.id AND q.provider_id = $2
+              )
+            )
         `,
         params: [id, req.user.id],
       },
@@ -767,17 +792,14 @@ router.get('/browse/:id', authenticate, authorize('provider'), async (req, res) 
       return res.status(404).json({ success: false, message: 'Tender not found or no longer open.' });
     }
 
-    const photos = photosResult.rows.map((p) => {
-      const { data: { publicUrl } } = supabase.storage
-        .from('tender-media')
-        .getPublicUrl(p.storage_path);
-      return {
-        id: p.id,
-        storage_path: p.storage_path,
-        url: publicUrl,
-        type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
-      };
-    });
+    // Signed URLs — tender-media is a private bucket (never public URLs).
+    const photoUrls = await signedUrlMap(supabase, 'tender-media', photosResult.rows.map((p) => p.storage_path));
+    const photos = photosResult.rows.map((p) => ({
+      id: p.id,
+      storage_path: p.storage_path,
+      url: photoUrls[p.storage_path] ?? null,
+      type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
+    }));
 
     res.json({ success: true, tender: tenderResult.rows[0], photos });
   } catch (err) {
@@ -967,17 +989,14 @@ router.get('/public/:id', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Tender not found or no longer open.' });
     }
 
-    const photos = photosResult.rows.map((p) => {
-      const { data: { publicUrl } } = supabase.storage
-        .from('tender-media')
-        .getPublicUrl(p.storage_path);
-      return {
-        id: p.id,
-        storage_path: p.storage_path,
-        url: publicUrl,
-        type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
-      };
-    });
+    // Signed URLs — tender-media is a private bucket (never public URLs).
+    const photoUrls = await signedUrlMap(supabase, 'tender-media', photosResult.rows.map((p) => p.storage_path));
+    const photos = photosResult.rows.map((p) => ({
+      id: p.id,
+      storage_path: p.storage_path,
+      url: photoUrls[p.storage_path] ?? null,
+      type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
+    }));
 
     res.set('Cache-Control', PUBLIC_CACHE);
     res.json({ success: true, tender: tenderResult.rows[0], photos });
@@ -1024,23 +1043,208 @@ router.get('/:id', authenticate, authorize('homeowner'), async (req, res) => {
       return res.status(404).json({ success: false, message: 'Tender not found.' });
     }
 
-    // tender-media is a public bucket — construct public URLs without signing
-    const photos = photosResult.rows.map((p) => {
-      const { data: { publicUrl } } = supabase.storage
-        .from('tender-media')
-        .getPublicUrl(p.storage_path);
-      return {
-        id: p.id,
-        storage_path: p.storage_path,
-        url: publicUrl,
-        type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
-      };
-    });
+    // Signed URLs — tender-media is a private bucket (never public URLs).
+    const photoUrls = await signedUrlMap(supabase, 'tender-media', photosResult.rows.map((p) => p.storage_path));
+    const photos = photosResult.rows.map((p) => ({
+      id: p.id,
+      storage_path: p.storage_path,
+      url: photoUrls[p.storage_path] ?? null,
+      type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(p.storage_path) ? 'video' : 'image',
+    }));
 
     res.json({ success: true, tender: tenderResult.rows[0], photos });
   } catch (err) {
     console.error('GET /api/tenders/:id error:', err);
     res.status(500).json({ success: false, message: 'Failed to load tender.' });
+  }
+});
+
+// ============================================================
+// PATCH /api/tenders/:id/complete
+// Homeowner marks an in-progress job as complete. Transitions the tender
+// in_progress → completed and settles the recorded transaction
+// (held → completed). WiPay is deferred, so this is a status/data transition
+// only — no real payout runs (see documentation/PAYMENTS_AND_JOB_WORKFLOW.md).
+// Notifies the winning provider (realtime + bell + push) so their job moves
+// from "Won / in progress" to "Completed" and earnings flip In Escrow → Paid.
+// ============================================================
+router.patch('/:id/complete', authenticate, authorize('homeowner'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Superuser read (bypasses RLS) — need the tender + winning provider + title.
+    const check = await db.query(`
+      SELECT t.id, t.client_id, t.status,
+             st.display_name AS service_name,
+             (SELECT provider_id FROM public.quotes q
+                WHERE q.tender_id = t.id AND q.status = 'accepted' LIMIT 1) AS provider_id,
+             (SELECT tx.provider_completed_at FROM public.transactions tx
+                WHERE tx.tender_id = t.id ORDER BY tx.created_at DESC LIMIT 1) AS provider_completed_at
+      FROM public.tenders t
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      WHERE t.id = $1
+    `, [id]);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Tender not found.' });
+    }
+    const row = check.rows[0];
+    if (row.client_id !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Forbidden.' });
+    }
+    if (row.status !== 'in_progress') {
+      return res.status(409).json({ success: false, message: 'Only an in-progress job can be marked complete.' });
+    }
+    // Two-step handshake: the provider must mark the job done first.
+    if (!row.provider_completed_at) {
+      return res.status(409).json({ success: false, message: 'The provider hasn’t marked this job done yet — you can confirm once they do.' });
+    }
+
+    await db.query(
+      `UPDATE public.tenders SET status = 'completed', updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+    // Settle the recorded transaction (held → completed). No real payout — WiPay deferred.
+    await db.query(
+      `UPDATE public.transactions
+         SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+       WHERE tender_id = $1 AND status = 'held'`,
+      [id]
+    );
+
+    res.json({ success: true });
+
+    // ── Fire-and-forget: tell the provider their job is complete ──────────
+    if (row.provider_id) {
+      const serviceName = row.service_name || 'your job';
+      const title = 'Job marked complete ✅';
+      const body  = `The homeowner marked "${serviceName}" complete. Your payout has been released to your earnings.`;
+      Promise.allSettled([
+        notifyUser(row.provider_id, 'job-completed', { tenderId: id }),
+        db.query(`
+          INSERT INTO public.notifications (user_id, type, title, body, data)
+          VALUES ($1, 'job_completed', $2, $3, $4::jsonb)
+        `, [row.provider_id, title, body, JSON.stringify({ tenderId: id })]),
+        sendPushToUser(row.provider_id, {
+          title, body, type: 'job_completed', url: '/earnings', data: { tender_id: id },
+        }),
+      ]).catch((err) => console.warn('PATCH /tenders/:id/complete — side-effect error:', err.message));
+    }
+  } catch (err) {
+    console.error('PATCH /api/tenders/:id/complete error:', err);
+    res.status(500).json({ success: false, message: 'Failed to complete the job.' });
+  }
+});
+
+// ============================================================
+// POST /api/tenders/:id/dispute   (multipart: image? + description)
+// Homeowner opens a dispute on an in-progress job. Records a disputes row,
+// flags the transaction 'disputed', and emails all admins (to review) + the
+// provider (support-style heads-up with the 72h SLA). Optional evidence photo
+// is stored in Supabase Storage. See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+// ============================================================
+router.post('/:id/dispute', authenticate, authorize('homeowner'), upload.single('image'), async (req, res) => {
+  const { id } = req.params;
+  const description = typeof req.body.description === 'string' ? req.body.description.trim() : '';
+  if (description.length < 15) {
+    return res.status(400).json({ success: false, message: 'Please describe what went wrong (at least 15 characters).' });
+  }
+  try {
+    const ctx = await db.query(`
+      SELECT t.id, t.client_id, t.display_code,
+             st.display_name AS service_name,
+             (cu.first_name || ' ' || cu.last_name) AS homeowner_name,
+             (SELECT tx.id     FROM public.transactions tx WHERE tx.tender_id = t.id ORDER BY tx.created_at DESC LIMIT 1) AS transaction_id,
+             (SELECT tx.status FROM public.transactions tx WHERE tx.tender_id = t.id ORDER BY tx.created_at DESC LIMIT 1) AS transaction_status,
+             (SELECT tx.provider_completed_at FROM public.transactions tx WHERE tx.tender_id = t.id ORDER BY tx.created_at DESC LIMIT 1) AS provider_completed_at,
+             (SELECT q.provider_id FROM public.quotes q WHERE q.tender_id = t.id AND q.status = 'accepted' LIMIT 1) AS provider_id
+      FROM public.tenders t
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users cu ON cu.id = t.client_id
+      WHERE t.id = $1
+    `, [id]);
+
+    if (ctx.rows.length === 0) return res.status(404).json({ success: false, message: 'Tender not found.' });
+    const row = ctx.rows[0];
+    if (row.client_id !== req.user.id) return res.status(403).json({ success: false, message: 'Forbidden.' });
+    if (!row.transaction_id || !row.provider_id) {
+      return res.status(409).json({ success: false, message: 'There is no active job to dispute.' });
+    }
+    if (row.transaction_status === 'completed') {
+      return res.status(409).json({ success: false, message: 'This job is already completed and can no longer be disputed.' });
+    }
+    // Two-step handshake: disputes open only after the provider marks the job done.
+    if (!row.provider_completed_at) {
+      return res.status(409).json({ success: false, message: 'You can open a dispute once the provider marks the job done.' });
+    }
+    const existing = await db.query(
+      `SELECT 1 FROM public.disputes WHERE transaction_id = $1 AND status = 'open' LIMIT 1`,
+      [row.transaction_id]
+    );
+    if (existing.rows.length) {
+      return res.status(409).json({ success: false, message: 'A dispute is already open for this job.' });
+    }
+
+    // Optional evidence photo → Supabase Storage (public tender-media bucket).
+    let imagePath = null, imageUrl = null;
+    if (req.file) {
+      const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+      const rand = Math.random().toString(36).slice(2, 7);
+      const storagePath = `disputes/${id}/${Date.now()}_${rand}${ext}`;
+      const { error: upErr } = await supabase.storage
+        .from('tender-media')
+        .upload(storagePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+      if (!upErr) {
+        imagePath = storagePath;
+        // Long-lived signed URL for the admin email (opened later); tender-media is private.
+        imageUrl = await signedUrl(supabase, 'tender-media', storagePath, EMAIL_TTL_SECONDS);
+      } else {
+        console.warn('dispute image upload error:', upErr.message);
+      }
+    }
+
+    const ins = await db.query(
+      `INSERT INTO public.disputes
+         (transaction_id, raised_by, client_id, provider_id, category, description, status, image_path)
+       VALUES ($1,$2,$3,$4,'service_quality',$5,'open',$6)
+       RETURNING id`,
+      [row.transaction_id, req.user.id, row.client_id, row.provider_id, description, imagePath]
+    );
+    await db.query(
+      `UPDATE public.transactions SET status = 'disputed', updated_at = NOW() WHERE id = $1`,
+      [row.transaction_id]
+    );
+
+    res.status(201).json({ success: true, disputeId: ins.rows[0].id });
+
+    // ── Fire-and-forget: email admins + provider, notify provider ─────────
+    (async () => {
+      const serviceName = row.service_name || 'the job';
+      const [admins, prov] = await Promise.all([
+        db.query(`SELECT email FROM public.users WHERE role = 'admin' AND email IS NOT NULL`),
+        db.query(`SELECT email, (first_name || ' ' || last_name) AS name FROM public.users WHERE id = $1`, [row.provider_id]),
+      ]);
+      const providerName = prov.rows[0]?.name || 'the provider';
+      const tasks = admins.rows.map((a) =>
+        sendDisputeAdminEmail(a.email, {
+          tenderTitle: serviceName, tenderCode: row.display_code,
+          homeownerName: row.homeowner_name, providerName, description, imageUrl,
+        })
+      );
+      tasks.push(sendDisputeProviderEmail(prov.rows[0]?.email, { providerName, tenderTitle: serviceName }));
+      tasks.push(notifyUser(row.provider_id, 'dispute-opened', { tenderId: id }));
+      tasks.push(db.query(
+        `INSERT INTO public.notifications (user_id, type, title, body, data)
+         VALUES ($1, 'dispute_opened', $2, $3, $4::jsonb)`,
+        [row.provider_id, 'A dispute was opened on your job',
+         `The homeowner raised a dispute on "${serviceName}". Our team will review within 72 hours and may contact you by phone or email.`,
+         JSON.stringify({ tenderId: id })]
+      ));
+      tasks.push(notifyChannel('admin-disputes', 'dispute-opened', { tenderId: id }));
+      await Promise.allSettled(tasks);
+    })().catch((err) => console.warn('POST /tenders/:id/dispute — side-effect error:', err.message));
+  } catch (err) {
+    console.error('POST /api/tenders/:id/dispute error:', err);
+    res.status(500).json({ success: false, message: 'Failed to open the dispute.' });
   }
 });
 
@@ -1185,18 +1389,14 @@ async function uploadPhotos(userId, tenderId, files) {
       },
     ]);
 
-    // Build response objects with public URLs (tender-media is a public bucket)
-    return results[0].rows.map(row => {
-      const { data: { publicUrl } } = supabase.storage
-        .from('tender-media')
-        .getPublicUrl(row.storage_path);
-      return {
-        id: row.id,
-        storage_path: row.storage_path,
-        url: publicUrl,
-        type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(row.storage_path) ? 'video' : 'image',
-      };
-    });
+    // Build response objects with signed URLs (tender-media is a private bucket)
+    const uploadUrls = await signedUrlMap(supabase, 'tender-media', results[0].rows.map((r) => r.storage_path));
+    return results[0].rows.map(row => ({
+      id: row.id,
+      storage_path: row.storage_path,
+      url: uploadUrls[row.storage_path] ?? null,
+      type: /\.(mp4|mov|webm|avi|mkv|wmv)$/i.test(row.storage_path) ? 'video' : 'image',
+    }));
   } catch (err) {
     console.error('Photo DB insert error:', err);
     return [];

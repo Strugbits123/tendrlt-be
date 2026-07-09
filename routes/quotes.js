@@ -2,9 +2,11 @@ const express = require('express');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { notifyUser, notifyChannel } = require('../lib/realtimeService');
-const { sendNewQuoteEmail } = require('../lib/quoteEmails');
+const { sendNewQuoteEmail, sendQuoteAcceptedEmail } = require('../lib/quoteEmails');
 const { sendPushToUser } = require('../lib/pushService');
 const { detectPII } = require('../lib/piiFilter');
+const supabase = require('../lib/supabaseClient');
+const { signedUrlMap } = require('../lib/storageUrls');
 
 const router = express.Router();
 
@@ -199,10 +201,18 @@ router.get('/received', authenticate, authorize('homeowner'), async (req, res) =
 router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, res) => {
   const { id } = req.params;
   try {
+    // Superuser query (bypasses RLS) so we can read the winning provider's
+    // contact + the quote amount + service name in one shot.
     const check = await db.query(`
-      SELECT q.id, q.tender_id, q.provider_id, t.client_id
+      SELECT q.id, q.tender_id, q.provider_id, q.amount, q.status AS quote_status,
+             t.client_id,
+             st.display_name AS service_name,
+             pr.email AS provider_email,
+             (pr.first_name || ' ' || pr.last_name) AS provider_name
       FROM public.quotes q
       JOIN public.tenders t ON t.id = q.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users pr ON pr.id = q.provider_id
       WHERE q.id = $1
     `, [id]);
 
@@ -226,16 +236,144 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
       [id]
     );
 
+    // ── Real-world workflow starts here (WiPay deferred) ──────────────────
+    // 1. Record a real transaction so payment/revenue numbers become live.
+    //    No money moves yet — status 'held' (escrow-held) until WiPay exists.
+    //    Fees come from the current live config (two-sided: client fee added on
+    //    top, provider fee deducted from payout). See
+    //    documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+    const cfg = await db.query(
+      `SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1`
+    );
+    const clientRate   = parseFloat(cfg.rows[0]?.client_rate)   || 9.5;
+    const providerRate = parseFloat(cfg.rows[0]?.provider_rate) || 12;
+    const amount       = row.amount;                              // JMD cents
+    const clientFee    = Math.round((amount * clientRate) / 100);
+    const providerFee  = Math.round((amount * providerRate) / 100);
+    const providerPayout = amount - providerFee;
+    const platformFee    = clientFee + providerFee;
+
+    await db.query(
+      `INSERT INTO public.transactions
+         (quote_id, tender_id, client_id, provider_id, amount,
+          client_fee, provider_fee, client_fee_rate, provider_fee_rate,
+          platform_fee, provider_payout, status, collected_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'held',NOW())
+       ON CONFLICT (quote_id) DO NOTHING`,
+      [id, row.tender_id, row.client_id, row.provider_id, amount,
+       clientFee, providerFee, clientRate, providerRate,
+       platformFee, providerPayout]
+    );
+
+    // 2. Move the tender into the active/in-progress workflow. This also hides
+    //    it from other providers' browse (which filters status = 'open').
+    await db.query(
+      `UPDATE public.tenders SET status = 'in_progress', updated_at = NOW() WHERE id = $1`,
+      [row.tender_id]
+    );
+
     res.json({ success: true });
 
-    // Realtime fan-out — winner first, then each losing provider.
-    notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }).catch(() => {});
-    for (const r of rejected.rows) {
-      notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id }).catch(() => {});
-    }
+    // ── Fire-and-forget fan-out ───────────────────────────────────────────
+    const serviceName = row.service_name || 'your job';
+    const winnerTitle  = 'Your quote was accepted 🎉';
+    const winnerBody   = `${serviceName} — the job is starting. Open the tender for the homeowner's contact details & location.`;
+
+    Promise.allSettled([
+      // Winner realtime event (existing behaviour — drives toast + My Quotes).
+      notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }),
+      // Winner persistent bell notification.
+      db.query(`
+        INSERT INTO public.notifications (user_id, type, title, body, data)
+        VALUES ($1, 'quote_accepted', $2, $3, $4::jsonb)
+      `, [row.provider_id, winnerTitle, winnerBody, JSON.stringify({ tenderId: row.tender_id })]),
+      // Winner email.
+      sendQuoteAcceptedEmail(row.provider_email, {
+        providerName: row.provider_name || 'there',
+        tenderTitle: serviceName,
+        amount,
+      }),
+      // Winner web push → deep-links to the tender detail (SW 'view_job' action).
+      sendPushToUser(row.provider_id, {
+        title: winnerTitle,
+        body: winnerBody,
+        type: 'quote_accepted',
+        url: `/tender/${row.tender_id}`,
+        data: { tender_id: row.tender_id },
+      }),
+      // Losing providers: realtime only (no email/push/bell, per product decision).
+      ...rejected.rows.map((r) =>
+        notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id })
+      ),
+    ]).catch((err) => {
+      console.warn('PATCH /api/quotes/:id/accept — side-effect error:', err.message);
+    });
   } catch (err) {
     console.error('PATCH /api/quotes/:id/accept error:', err);
     res.status(500).json({ success: false, message: 'Failed to accept quote.' });
+  }
+});
+
+// ============================================================
+// PATCH /api/quotes/:id/mark-done
+// Step 1 of the two-step completion handshake: the WINNING PROVIDER marks
+// their job done. This only records provider_completed_at on the transaction —
+// the tender stays 'in_progress' until the homeowner confirms (or disputes).
+// Notifies the homeowner so they can confirm completion / open a dispute.
+// See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+// ============================================================
+router.patch('/:id/mark-done', authenticate, authorize('provider'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await db.query(`
+      SELECT q.id, q.provider_id, q.status AS quote_status, q.tender_id,
+             t.client_id, t.status AS tender_status,
+             st.display_name AS service_name,
+             tx.id AS transaction_id, tx.status AS transaction_status, tx.provider_completed_at
+      FROM public.quotes q
+      JOIN public.tenders t ON t.id = q.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      LEFT JOIN public.transactions tx ON tx.quote_id = q.id
+      WHERE q.id = $1
+    `, [id]);
+
+    if (check.rows.length === 0) return res.status(404).json({ success: false, message: 'Quote not found.' });
+    const row = check.rows[0];
+    if (row.provider_id !== req.user.id) return res.status(403).json({ success: false, message: 'Forbidden.' });
+    if (row.quote_status !== 'accepted' || !row.transaction_id) {
+      return res.status(409).json({ success: false, message: 'This job is not active.' });
+    }
+    if (row.transaction_status === 'completed') {
+      return res.status(409).json({ success: false, message: 'This job is already completed.' });
+    }
+    if (row.provider_completed_at) {
+      return res.status(409).json({ success: false, message: 'You already marked this job done — awaiting the homeowner.' });
+    }
+
+    await db.query(
+      `UPDATE public.transactions SET provider_completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [row.transaction_id]
+    );
+
+    res.json({ success: true });
+
+    // ── Notify the homeowner: confirm or dispute ──────────────────────────
+    const serviceName = row.service_name || 'your job';
+    const title = 'Provider marked the job done ✅';
+    const body  = `The provider marked "${serviceName}" as done. Review the work, then confirm completion or open a dispute.`;
+    Promise.allSettled([
+      notifyUser(row.client_id, 'job-marked-done', { tenderId: row.tender_id }),
+      db.query(`
+        INSERT INTO public.notifications (user_id, type, title, body, data)
+        VALUES ($1, 'job_marked_done', $2, $3, $4::jsonb)
+      `, [row.client_id, title, body, JSON.stringify({ tenderId: row.tender_id })]),
+      sendPushToUser(row.client_id, {
+        title, body, type: 'job_marked_done', url: '/my-tenders', data: { tender_id: row.tender_id },
+      }),
+    ]).catch((err) => console.warn('PATCH /api/quotes/:id/mark-done — side-effect error:', err.message));
+  } catch (err) {
+    console.error('PATCH /api/quotes/:id/mark-done error:', err);
+    res.status(500).json({ success: false, message: 'Failed to mark the job done.' });
   }
 });
 
@@ -249,18 +387,46 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
       SELECT
         q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
         q.message, q.what_is_included, q.status, q.created_at,
-        t.parish, t.urgency, t.category,
+        t.parish, t.urgency, t.category, t.status AS tender_status,
+        tx.provider_completed_at,
+        disp.description   AS dispute_description,
+        disp.image_path    AS dispute_image_path,
+        disp.created_at    AS dispute_created_at,
+        (disp.id IS NOT NULL) AS has_open_dispute,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
       FROM public.quotes q
       JOIN public.tenders t ON t.id = q.tender_id
+      LEFT JOIN public.transactions tx ON tx.quote_id = q.id
+      LEFT JOIN LATERAL (
+        SELECT d.id, d.description, d.image_path, d.created_at
+        FROM public.disputes d
+        WHERE d.transaction_id = tx.id AND d.status = 'open'
+        ORDER BY d.created_at DESC LIMIT 1
+      ) disp ON true
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
       WHERE q.provider_id = $1
         AND t.trashed_at IS NULL   -- hide quotes on admin-removed tenders (restored if the tender is restored)
       ORDER BY q.created_at DESC
     `, [req.user.id]);
 
-    res.json({ success: true, quotes: result.rows });
+    // Sign any dispute evidence images (private tender-media bucket) in one batch.
+    const disputeImagePaths = result.rows.map((r) => r.dispute_image_path).filter(Boolean);
+    const disputeUrls = await signedUrlMap(supabase, 'tender-media', disputeImagePaths);
+
+    const quotes = result.rows.map((r) => {
+      const { dispute_description, dispute_image_path, dispute_created_at, ...q } = r;
+      q.dispute = r.has_open_dispute
+        ? {
+            description: dispute_description,
+            createdAt: dispute_created_at,
+            imageUrl: dispute_image_path ? (disputeUrls[dispute_image_path] ?? null) : null,
+          }
+        : null;
+      return q;
+    });
+
+    res.json({ success: true, quotes });
   } catch (err) {
     console.error('GET /api/quotes/mine error:', err);
     res.status(500).json({ success: false, message: 'Failed to load quotes.' });

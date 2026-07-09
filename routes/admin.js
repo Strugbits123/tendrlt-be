@@ -7,7 +7,7 @@ const {
   sendProviderApprovedEmail,
   sendProviderRejectedEmail,
 } = require('../lib/verificationEmails');
-const { notifyUser } = require('../lib/realtimeService');
+const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendTenderRemovedEmail } = require('../lib/tenderEmails');
 
 const router = express.Router();
@@ -447,6 +447,26 @@ router.get('/tenders', async (req, res) => {
   }
 });
 
+// GET /api/admin/tenders/active-count — count of live "Active" tenders for the
+// sidebar badge (open, not admin-removed, not expired, not yet awarded) — mirrors
+// the Active/Live bucket on the admin Tenders page.
+router.get('/tenders/active-count', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT COUNT(*)::int AS count
+      FROM public.tenders t
+      WHERE t.status = 'open'
+        AND t.trashed_at IS NULL
+        AND (t.expires_at IS NULL OR t.expires_at > NOW())
+        AND NOT EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = t.id AND q.status = 'accepted')
+    `);
+    res.json({ success: true, count: r.rows[0].count });
+  } catch (err) {
+    console.error('GET /api/admin/tenders/active-count error:', err);
+    res.status(500).json({ success: false, message: 'Failed to count tenders.' });
+  }
+});
+
 // POST /api/admin/tenders/:code/trash — soft-delete (hides from browse/explore
 // and marks the homeowner's copy "Rejected by admin"). Optional { reason }.
 router.post('/tenders/:code/trash', async (req, res) => {
@@ -490,6 +510,8 @@ router.post('/tenders/:code/trash', async (req, res) => {
       ),
       // Refresh the My Quotes list of every provider who quoted — their quote is now hidden.
       notifyQuoteProviders(t.id),
+      // Drop it from every provider's Browse grid + recount their stats, live.
+      notifyChannel('tenders-feed', 'tender-removed', { tenderId: t.id }),
     ]).catch((err) => console.warn('trash notify error:', err.message));
   } catch (err) {
     console.error('POST /api/admin/tenders/:code/trash error:', err);
@@ -528,6 +550,8 @@ router.post('/tenders/:code/restore', async (req, res) => {
       ),
       // Refresh My Quotes for providers who quoted — their quote is visible again.
       notifyQuoteProviders(t.id),
+      // Re-add it to providers' Browse grids + recount, live.
+      notifyChannel('tenders-feed', 'tender-restored', { tenderId: t.id }),
     ]).catch((err) => console.warn('restore notify error:', err.message));
   } catch (err) {
     console.error('POST /api/admin/tenders/:code/restore error:', err);
@@ -571,6 +595,431 @@ router.delete('/tenders/:code/quotes/:pid', async (req, res) => {
   } catch (err) {
     console.error('DELETE /api/admin/tenders/:code/quotes/:pid error:', err);
     res.status(500).json({ success: false, message: 'Failed to remove quote.' });
+  }
+});
+
+// ============================================================
+// Admin Contact Inbox
+// Reads/writes public.contact_messages. The public form stores the subject
+// as the exact <option> label text (see tendrlt-fe/app/contact/page.tsx);
+// we map that + the homeowner/provider/other role onto the admin UI's enums.
+// ============================================================
+
+const CONTACT_ROLE_MAP = { homeowner: 'client', provider: 'provider' };
+const toContactRole = (r) => CONTACT_ROLE_MAP[r] || 'other';
+
+const CONTACT_SUBJECT_MAP = {
+  'Problem with a quote': 'quote',
+  'Payment or escrow issue': 'payment',
+  'Provider verification': 'verification',
+  'Account access': 'account',
+  'Report a user': 'report',
+  'Feature request': 'feature',
+  'General question': 'question',
+  'Other': 'other',
+};
+const toContactSubject = (s) => CONTACT_SUBJECT_MAP[s] || 'other';
+
+const INBOX_STATUSES = ['new', 'read', 'resolved', 'archived'];
+
+const shapeContactMessage = (r) => ({
+  id: r.id,
+  fn: r.first_name,
+  ln: r.last_name || '',
+  email: r.email,
+  role: toContactRole(r.role),
+  subject: toContactSubject(r.subject),
+  msg: r.message,
+  date: r.created_at.toISOString().slice(0, 10),
+  status: r.status,
+  trashed: r.trashed,
+});
+
+// GET /api/admin/contact-messages
+router.get('/contact-messages', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT id, first_name, last_name, email, role, subject, message, status, trashed, created_at
+      FROM public.contact_messages
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, items: r.rows.map(shapeContactMessage) });
+  } catch (err) {
+    console.error('GET /api/admin/contact-messages error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load contact messages.' });
+  }
+});
+
+// PATCH /api/admin/contact-messages/:id/status   body: { status }
+router.patch('/contact-messages/:id/status', async (req, res) => {
+  const { status } = req.body || {};
+  if (!INBOX_STATUSES.includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid status.' });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.contact_messages SET status = $2 WHERE id = $1 RETURNING id`,
+      [req.params.id, status]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/admin/contact-messages/:id/status error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update status.' });
+  }
+});
+
+// POST /api/admin/contact-messages/:id/trash
+router.post('/contact-messages/:id/trash', async (req, res) => {
+  try {
+    const r = await db.query(
+      `UPDATE public.contact_messages SET trashed = true WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/admin/contact-messages/:id/trash error:', err);
+    res.status(500).json({ success: false, message: 'Failed to trash message.' });
+  }
+});
+
+// POST /api/admin/contact-messages/:id/restore
+router.post('/contact-messages/:id/restore', async (req, res) => {
+  try {
+    const r = await db.query(
+      `UPDATE public.contact_messages SET trashed = false WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/admin/contact-messages/:id/restore error:', err);
+    res.status(500).json({ success: false, message: 'Failed to restore message.' });
+  }
+});
+
+// DELETE /api/admin/contact-messages/:id
+router.delete('/contact-messages/:id', async (req, res) => {
+  try {
+    const r = await db.query(`DELETE FROM public.contact_messages WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Message not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/admin/contact-messages/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete message.' });
+  }
+});
+
+// ============================================================
+// Admin Feedback Inbox
+// Reads/writes public.feedback_submissions. The public form only ever sends
+// role in {client, provider, visitor, other} and never collects a subject.
+// ============================================================
+
+const FEEDBACK_ROLE_MAP = { client: 'client', provider: 'provider', visitor: 'visitor' };
+const toFeedbackRole = (r) => FEEDBACK_ROLE_MAP[r] || 'other';
+
+const shapeFeedbackItem = (r) => ({
+  id: r.id,
+  cat: r.cat,
+  name: r.name,
+  email: r.email,
+  role: toFeedbackRole(r.role),
+  msg: r.message,
+  rating: r.rating,
+  followUp: r.follow_up,
+  date: r.created_at.toISOString().slice(0, 10),
+  status: r.status,
+});
+
+// GET /api/admin/feedback-submissions
+router.get('/feedback-submissions', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT id, cat, name, email, role, rating, follow_up, message, status, created_at
+      FROM public.feedback_submissions
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, items: r.rows.map(shapeFeedbackItem) });
+  } catch (err) {
+    console.error('GET /api/admin/feedback-submissions error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load feedback submissions.' });
+  }
+});
+
+// PATCH /api/admin/feedback-submissions/:id/status   body: { status }
+router.patch('/feedback-submissions/:id/status', async (req, res) => {
+  const { status } = req.body || {};
+  if (!INBOX_STATUSES.includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid status.' });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.feedback_submissions SET status = $2 WHERE id = $1 RETURNING id`,
+      [req.params.id, status]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Submission not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/admin/feedback-submissions/:id/status error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update status.' });
+  }
+});
+
+// ============================================================
+// Platform Fee Configuration (admin-only)
+// Reads/writes platform_fee_config (singleton) + fee_change_history (audit).
+// Every change broadcasts on 'platform-fees' so the whole app updates live.
+// ============================================================
+
+const num = (v) => (v == null ? null : parseFloat(v));
+
+// Map a DB history row to the admin-screen HistoryEntry shape.
+const shapeFeeHistory = (h) => {
+  const created = new Date(h.created_at);
+  return {
+    id:           h.code,
+    date:         created.toISOString().slice(0, 10),
+    time:         created.toISOString().slice(11, 16),
+    by:           h.changed_by_name || 'TendrIt Admin',
+    role:         'Platform Owner',
+    type:         h.type,
+    old_client:   num(h.old_client),
+    old_provider: num(h.old_provider),
+    new_client:   num(h.new_client),
+    new_provider: num(h.new_provider),
+    effective:    h.effective ? new Date(h.effective).toISOString().slice(0, 10) : null,
+    reason:       h.reason || '',
+    status:       h.status,
+    batches_applied: 0,
+  };
+};
+
+async function loadFeeConfig() {
+  const [cfg, hist] = await Promise.all([
+    db.query('SELECT * FROM public.platform_fee_config WHERE id = 1'),
+    db.query(`
+      SELECT h.*, (u.first_name || ' ' || u.last_name) AS changed_by_name
+      FROM public.fee_change_history h
+      LEFT JOIN public.users u ON u.id = h.changed_by
+      ORDER BY h.created_at ASC
+    `),
+  ]);
+  const c = cfg.rows[0] || {};
+  return {
+    config: {
+      client_rate:   num(c.client_rate),
+      provider_rate: num(c.provider_rate),
+      client_effective:   c.client_effective ? new Date(c.client_effective).toISOString().slice(0, 10) : null,
+      provider_effective: c.provider_effective ? new Date(c.provider_effective).toISOString().slice(0, 10) : null,
+    },
+    history: hist.rows.map(shapeFeeHistory),
+  };
+}
+
+const broadcastFees = (config) =>
+  notifyChannel('platform-fees', 'fees-updated', {
+    clientRate: config.client_rate,
+    providerRate: config.provider_rate,
+  }).catch(() => {});
+
+// GET /api/admin/fee-config — current config + full change history.
+router.get('/fee-config', async (req, res) => {
+  try {
+    res.json({ success: true, ...(await loadFeeConfig()) });
+  } catch (err) {
+    console.error('GET /api/admin/fee-config error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load fee config.' });
+  }
+});
+
+// PATCH /api/admin/fee-config { side, rate, effective, reason } — change one side.
+router.patch('/fee-config', async (req, res) => {
+  const { side, rate, effective, reason } = req.body || {};
+  if (side !== 'client' && side !== 'provider') {
+    return res.status(400).json({ success: false, message: 'side must be "client" or "provider".' });
+  }
+  const r = parseFloat(rate);
+  if (isNaN(r) || r < 0 || r > 100) {
+    return res.status(400).json({ success: false, message: 'Rate must be between 0 and 100.' });
+  }
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ success: false, message: 'A reason is required.' });
+  }
+  if (!effective) {
+    return res.status(400).json({ success: false, message: 'An effective date is required.' });
+  }
+  try {
+    const cur = (await db.query('SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1')).rows[0];
+    const oldClient = num(cur.client_rate);
+    const oldProvider = num(cur.provider_rate);
+    const newClient = side === 'client' ? r : oldClient;
+    const newProvider = side === 'provider' ? r : oldProvider;
+
+    // side is validated to a fixed literal above — safe to interpolate the column.
+    await db.query(
+      `UPDATE public.platform_fee_config SET ${side}_rate = $1, ${side}_effective = $2, updated_at = NOW() WHERE id = 1`,
+      [r, effective]
+    );
+    await db.query(
+      `UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active' AND (type = $1 OR type = 'both')`,
+      [side]
+    );
+    await db.query(
+      `INSERT INTO public.fee_change_history
+         (code, type, old_client, old_provider, new_client, new_provider, effective, reason, changed_by, status)
+       VALUES ('FCH-' || lpad(nextval('public.fee_change_code_seq')::text, 3, '0'),
+               $1, $2, $3, $4, $5, $6, $7, $8, 'active')`,
+      [side, oldClient, oldProvider, newClient, newProvider, effective, reason.trim(), req.user.id]
+    );
+
+    const out = await loadFeeConfig();
+    res.json({ success: true, ...out });
+    broadcastFees(out.config);
+  } catch (err) {
+    console.error('PATCH /api/admin/fee-config error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update fee config.' });
+  }
+});
+
+// POST /api/admin/fee-config/rollback { client, provider } — revert the checked
+// side(s) to their previous historical value. Entries are individual per side.
+router.post('/fee-config/rollback', async (req, res) => {
+  const doClient = !!(req.body && req.body.client);
+  const doProvider = !!(req.body && req.body.provider);
+  if (!doClient && !doProvider) {
+    return res.status(400).json({ success: false, message: 'Select at least one side to roll back.' });
+  }
+  try {
+    const cur = (await db.query('SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1')).rows[0];
+    const oldClient = num(cur.client_rate);
+    const oldProvider = num(cur.provider_rate);
+    let newClient = oldClient;
+    let newProvider = oldProvider;
+
+    if (doClient) {
+      const prev = (await db.query(
+        `SELECT old_client FROM public.fee_change_history WHERE type IN ('client','both') ORDER BY created_at DESC LIMIT 1`
+      )).rows[0];
+      if (!prev) return res.status(400).json({ success: false, message: 'No previous client fee to roll back to.' });
+      newClient = num(prev.old_client);
+    }
+    if (doProvider) {
+      const prev = (await db.query(
+        `SELECT old_provider FROM public.fee_change_history WHERE type IN ('provider','both') ORDER BY created_at DESC LIMIT 1`
+      )).rows[0];
+      if (!prev) return res.status(400).json({ success: false, message: 'No previous provider fee to roll back to.' });
+      newProvider = num(prev.old_provider);
+    }
+
+    if (doClient) {
+      await db.query(`UPDATE public.platform_fee_config SET client_rate = $1, client_effective = CURRENT_DATE, updated_at = NOW() WHERE id = 1`, [newClient]);
+    }
+    if (doProvider) {
+      await db.query(`UPDATE public.platform_fee_config SET provider_rate = $1, provider_effective = CURRENT_DATE, updated_at = NOW() WHERE id = 1`, [newProvider]);
+    }
+
+    // Supersede the active entries for the rolled-back side(s).
+    if (doClient && doProvider) {
+      await db.query(`UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active'`);
+    } else {
+      const side = doClient ? 'client' : 'provider';
+      await db.query(`UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active' AND (type = $1 OR type = 'both')`, [side]);
+    }
+
+    const type = doClient && doProvider ? 'both' : doClient ? 'client' : 'provider';
+    const sidesLabel = [doClient && 'Client', doProvider && 'Provider'].filter(Boolean).join(' & ');
+    await db.query(
+      `INSERT INTO public.fee_change_history
+         (code, type, old_client, old_provider, new_client, new_provider, effective, reason, changed_by, status)
+       VALUES ('FCH-' || lpad(nextval('public.fee_change_code_seq')::text, 3, '0'),
+               $1, $2, $3, $4, $5, CURRENT_DATE, $6, $7, 'active')`,
+      [type, oldClient, oldProvider, newClient, newProvider, `Rollback (${sidesLabel})`, req.user.id]
+    );
+
+    const out = await loadFeeConfig();
+    res.json({ success: true, ...out });
+    broadcastFees(out.config);
+  } catch (err) {
+    console.error('POST /api/admin/fee-config/rollback error:', err);
+    res.status(500).json({ success: false, message: 'Failed to roll back fee config.' });
+  }
+});
+
+// ============================================================
+// GET /api/admin/revenue?period=30d
+// Real platform revenue from public.transactions (recorded on quote accept —
+// WiPay deferred, status 'held'; no money moves yet). Returns money fields the
+// admin dashboard revenue widgets merge over their mock period row; activity /
+// growth metrics remain mock until separately wired.
+// See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+// ============================================================
+const REVENUE_WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 365, all: null };
+
+const compactMoney = (cents) => {
+  const d = Math.round((cents || 0) / 100);
+  if (d >= 1e6) return (d / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+  if (d >= 1e3) return Math.round(d / 1e3) + 'K';
+  return d.toLocaleString('en-US');
+};
+const fullMoney = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
+
+router.get('/revenue', async (req, res) => {
+  const period = REVENUE_WINDOWS.hasOwnProperty(req.query.period) ? req.query.period : '30d';
+  const days = REVENUE_WINDOWS[period]; // null = all-time
+  try {
+    const sums = `
+      SELECT COALESCE(SUM(amount),0)::bigint       AS gmv,
+             COALESCE(SUM(client_fee),0)::bigint   AS cfee,
+             COALESCE(SUM(provider_fee),0)::bigint AS pfee,
+             COALESCE(SUM(platform_fee),0)::bigint AS rev,
+             COUNT(*)::int                          AS done
+      FROM public.transactions`;
+
+    const current = await db.query(
+      `${sums} WHERE ($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`,
+      [days]
+    );
+    const c = current.rows[0];
+
+    // Delta vs the immediately preceding window of equal length (skip for all-time).
+    let deltaRev = '—';
+    if (days !== null) {
+      const prev = await db.query(
+        `${sums} WHERE created_at >= NOW() - (INTERVAL '1 day' * $1 * 2)
+                   AND created_at <  NOW() - (INTERVAL '1 day' * $1)`,
+        [days]
+      );
+      const prevRev = Number(prev.rows[0].rev);
+      const curRev = Number(c.rev);
+      if (prevRev > 0) {
+        const pct = ((curRev - prevRev) / prevRev) * 100;
+        deltaRev = `${pct >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(1)}%`;
+      } else if (curRev > 0) {
+        deltaRev = '↑ new';
+      }
+    }
+
+    const done = c.done || 0;
+    res.json({
+      success: true,
+      revenue: {
+        rev: compactMoney(c.rev),
+        cfee: compactMoney(c.cfee),
+        pfee: compactMoney(c.pfee),
+        gmv: compactMoney(c.gmv),
+        done,
+        delta_rev: deltaRev,
+        fee_clients: fullMoney(c.cfee),
+        fee_provs: fullMoney(c.pfee),
+        fee_per_job: done ? 'J$' + fullMoney(Number(c.rev) / done) : 'J$0',
+        avg_gmv: done ? 'J$' + fullMoney(Number(c.gmv) / done) : 'J$0',
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/admin/revenue error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load revenue.' });
   }
 });
 
