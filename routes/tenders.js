@@ -9,6 +9,7 @@ const { sendNewTenderEmail } = require('../lib/tenderEmails');
 const { sendPushToUser }     = require('../lib/pushService');
 const { sendDisputeAdminEmail, sendDisputeProviderEmail } = require('../lib/disputeEmails');
 const { signedUrl, signedUrlMap, EMAIL_TTL_SECONDS } = require('../lib/storageUrls');
+const { getActiveRates } = require('../lib/feeConfig');
 
 const router = express.Router();
 
@@ -187,6 +188,10 @@ router.post('/',
     const lat = location_lat ? parseFloat(location_lat) : null;
     const lng = location_lng ? parseFloat(location_lng) : null;
 
+    // Snapshot the client platform-fee rate in effect right now, so a later fee
+    // change never re-prices this job. See PAYMENTS_AND_JOB_WORKFLOW.md.
+    const { clientRate: clientFeeRate } = await getActiveRates();
+
     try {
       const insertResult = await db.queryAsUser(req.user.id, `
         INSERT INTO public.tenders (
@@ -195,7 +200,7 @@ router.post('/',
           preferred_start_date, budget_min, budget_max,
           contact_name, contact_phone, contact_email,
           location_lat, location_lng, status,
-          expiry_days, terms_accepted_at, expires_at
+          expiry_days, client_fee_rate, terms_accepted_at, expires_at
         )
         SELECT
           $1, $2::service_category, st.id, $3,
@@ -203,7 +208,7 @@ router.post('/',
           $7::date, $8, $9,
           $10, $11, $12,
           $13, $14, $15::tender_status,
-          $16::smallint,
+          $16::smallint, $17,
           CASE WHEN $15::tender_status = 'open' THEN NOW() ELSE NULL END,
           CASE WHEN $15::tender_status = 'open' AND $16 IS NOT NULL
                THEN NOW() + ($16::int * INTERVAL '1 day') ELSE NULL END
@@ -227,6 +232,7 @@ router.post('/',
         lng,
         status,
         expiryDaysVal,
+        clientFeeRate,
       ]);
 
       if (insertResult.rows.length === 0) {

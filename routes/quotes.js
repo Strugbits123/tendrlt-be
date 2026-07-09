@@ -7,6 +7,7 @@ const { sendPushToUser } = require('../lib/pushService');
 const { detectPII } = require('../lib/piiFilter');
 const supabase = require('../lib/supabaseClient');
 const { signedUrlMap } = require('../lib/storageUrls');
+const { getActiveRates } = require('../lib/feeConfig');
 
 const router = express.Router();
 
@@ -69,12 +70,16 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
       return res.status(403).json({ success: false, message: 'You cannot quote on your own tender.' });
     }
 
+    // Snapshot the provider service-fee rate in effect now, so a later fee
+    // change never re-prices this quote's payout. See PAYMENTS_AND_JOB_WORKFLOW.md.
+    const { providerRate: providerFeeRate } = await getActiveRates();
+
     // Insert the quote — unique constraint will catch duplicates
     const insertResult = await db.queryAsUser(req.user.id, `
       INSERT INTO public.quotes (
         tender_id, provider_id, amount, timeline,
-        preferred_start_date, message, what_is_included
-      ) VALUES ($1, $2, $3, $4::quote_timeline, $5::date, $6, $7)
+        preferred_start_date, message, what_is_included, provider_fee_rate
+      ) VALUES ($1, $2, $3, $4::quote_timeline, $5::date, $6, $7, $8)
       RETURNING *
     `, [
       tender_id,
@@ -84,6 +89,7 @@ router.post('/', authenticate, authorize('provider'), async (req, res) => {
       preferred_start_date || null,
       message.trim(),
       what_is_included ? what_is_included.trim() : null,
+      providerFeeRate,
     ]);
 
     const quote = insertResult.rows[0];
@@ -205,7 +211,8 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
     // contact + the quote amount + service name in one shot.
     const check = await db.query(`
       SELECT q.id, q.tender_id, q.provider_id, q.amount, q.status AS quote_status,
-             t.client_id,
+             q.provider_fee_rate,
+             t.client_id, t.client_fee_rate,
              st.display_name AS service_name,
              pr.email AS provider_email,
              (pr.first_name || ' ' || pr.last_name) AS provider_name
@@ -239,14 +246,18 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
     // ── Real-world workflow starts here (WiPay deferred) ──────────────────
     // 1. Record a real transaction so payment/revenue numbers become live.
     //    No money moves yet — status 'held' (escrow-held) until WiPay exists.
-    //    Fees come from the current live config (two-sided: client fee added on
-    //    top, provider fee deducted from payout). See
-    //    documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
-    const cfg = await db.query(
-      `SELECT client_rate, provider_rate FROM public.platform_fee_config WHERE id = 1`
-    );
-    const clientRate   = parseFloat(cfg.rows[0]?.client_rate)   || 9.5;
-    const providerRate = parseFloat(cfg.rows[0]?.provider_rate) || 12;
+    //    Fees are LOCKED at creation time: the client rate snapshotted on the
+    //    tender when it was posted, and the provider rate snapshotted on the
+    //    quote when it was submitted. A later fee change never re-prices this
+    //    job. Fall back to the live config only for pre-snapshot (legacy) rows.
+    //    See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+    let clientRate   = row.client_fee_rate   != null ? parseFloat(row.client_fee_rate)   : null;
+    let providerRate = row.provider_fee_rate != null ? parseFloat(row.provider_fee_rate) : null;
+    if (clientRate == null || providerRate == null) {
+      const live = await getActiveRates();
+      if (clientRate == null)   clientRate   = live.clientRate;
+      if (providerRate == null) providerRate = live.providerRate;
+    }
     const amount       = row.amount;                              // JMD cents
     const clientFee    = Math.round((amount * clientRate) / 100);
     const providerFee  = Math.round((amount * providerRate) / 100);
@@ -387,6 +398,7 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
       SELECT
         q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
         q.message, q.what_is_included, q.status, q.created_at,
+        q.provider_fee_rate,
         t.parish, t.urgency, t.category, t.status AS tender_status,
         tx.provider_completed_at,
         disp.description   AS dispute_description,
@@ -416,6 +428,8 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
 
     const quotes = result.rows.map((r) => {
       const { dispute_description, dispute_image_path, dispute_created_at, ...q } = r;
+      // NUMERIC → number for the client.
+      q.provider_fee_rate = q.provider_fee_rate != null ? parseFloat(q.provider_fee_rate) : null;
       q.dispute = r.has_open_dispute
         ? {
             description: dispute_description,
@@ -447,12 +461,13 @@ router.get('/:id', authenticate, async (req, res) => {
       SELECT
         q.id, q.tender_id, q.amount, q.timeline, q.preferred_start_date,
         q.message, q.what_is_included, q.status, q.created_at,
+        q.provider_fee_rate,
         u.id         AS provider_id,
         u.first_name AS provider_first_name,
         u.last_name  AS provider_last_name,
         st.display_name AS tender_title,
         st.emoji        AS tender_emoji,
-        t.client_id
+        t.client_id, t.client_fee_rate
       FROM public.quotes q
       JOIN public.tenders t  ON t.id  = q.tender_id
       JOIN public.users   u  ON u.id  = q.provider_id
@@ -473,6 +488,9 @@ router.get('/:id', authenticate, async (req, res) => {
     }
 
     const { client_id: _omit, ...quote } = row;
+    // NUMERIC columns come back as strings — send real numbers to the client.
+    quote.client_fee_rate   = quote.client_fee_rate   != null ? parseFloat(quote.client_fee_rate)   : null;
+    quote.provider_fee_rate = quote.provider_fee_rate != null ? parseFloat(quote.provider_fee_rate) : null;
     res.json({ success: true, quote });
   } catch (err) {
     console.error('GET /api/quotes/:id error:', err);
