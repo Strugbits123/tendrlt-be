@@ -44,6 +44,7 @@ const DEFAULT_PARAGRAPH =
   'chats with providers, and awards the job to the best fit.';
 
 async function main() {
+  console.log(API_KEY)
   if (!API_KEY) {
     console.error('✗ CLAUDE_API_KEY not found in .env');
     process.exitCode = 1;
