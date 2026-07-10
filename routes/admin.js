@@ -1297,4 +1297,211 @@ router.post('/disputes/:id/resolve', async (req, res) => {
   }
 });
 
+// ============================================================
+// GET /api/admin/providers — analytics for the admin Providers screen.
+// Read-only aggregation across users/provider_profiles/quotes/transactions/
+// reviews. Money in JMD cents. db.query (superuser) — route is admin-gated.
+// ============================================================
+router.get('/providers', async (req, res) => {
+  try {
+    const provsP = db.query(`
+      SELECT
+        u.id                                    AS provider_id,
+        u.display_code,
+        (u.first_name || ' ' || u.last_name)    AS name,
+        u.parish,
+        pp.verification_status,
+        COALESCE(pp.is_verified, false)         AS is_verified,
+        COALESCE(jw.jobs_won, 0)::int           AS jobs_won,
+        COALESCE(er.earnings_cents, 0)::bigint  AS earnings_cents,
+        rv.avg_rating,
+        COALESCE(rv.review_count, 0)::int       AS review_count,
+        rt.avg_response_hrs,
+        COALESCE(cats.cats, ARRAY[]::text[])    AS cats,
+        (COALESCE(rq.recent_quotes, 0) > 0)     AS active
+      FROM public.users u
+      LEFT JOIN public.provider_profiles pp ON pp.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, COUNT(*) AS jobs_won FROM public.quotes WHERE status = 'accepted' GROUP BY provider_id) jw ON jw.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, SUM(provider_payout) AS earnings_cents FROM public.transactions GROUP BY provider_id) er ON er.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, AVG(rating) AS avg_rating, COUNT(*) AS review_count FROM public.reviews GROUP BY provider_id) rv ON rv.provider_id = u.id
+      LEFT JOIN (SELECT q.provider_id, AVG(EXTRACT(EPOCH FROM (q.created_at - t.created_at)) / 3600.0) AS avg_response_hrs
+                 FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id GROUP BY q.provider_id) rt ON rt.provider_id = u.id
+      LEFT JOIN (SELECT ps.provider_id, ARRAY_AGG(DISTINCT st.display_name) AS cats
+                 FROM public.provider_services ps JOIN public.service_types st ON st.id = ps.service_type_id GROUP BY ps.provider_id) cats ON cats.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, COUNT(*) AS recent_quotes FROM public.quotes WHERE created_at >= NOW() - INTERVAL '30 days' GROUP BY provider_id) rq ON rq.provider_id = u.id
+      WHERE u.role = 'provider'
+      ORDER BY jobs_won DESC, earnings_cents DESC
+    `);
+
+    const statsP = db.query(`
+      SELECT
+        (SELECT COUNT(*) FROM public.users WHERE role = 'provider')::int AS total_providers,
+        (SELECT COUNT(*) FROM public.provider_profiles WHERE verification_status = 'approved')::int AS verified_count,
+        (SELECT COUNT(DISTINCT provider_id) FROM public.quotes WHERE created_at >= NOW() - INTERVAL '30 days')::int AS active_count,
+        (SELECT AVG(rating) FROM public.reviews) AS avg_rating,
+        (SELECT COUNT(*) FROM public.reviews)::int AS review_count,
+        (SELECT AVG(EXTRACT(EPOCH FROM (q.created_at - t.created_at)) / 3600.0)
+           FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id) AS avg_response_hrs,
+        (SELECT COUNT(*) FROM (SELECT provider_id FROM public.reviews GROUP BY provider_id HAVING AVG(rating) < 3) x)::int AS flagged_below3
+    `);
+
+    const distP = db.query(`SELECT rating AS stars, COUNT(*)::int AS count FROM public.reviews GROUP BY rating`);
+
+    const clientsP = db.query(`
+      SELECT u.display_code, (u.first_name || ' ' || u.last_name) AS name,
+             SUM(tx.amount + tx.client_fee)::bigint AS spend_cents,
+             COUNT(*)::int AS jobs
+      FROM public.transactions tx
+      JOIN public.users u ON u.id = tx.client_id
+      GROUP BY u.id, u.display_code, name
+      ORDER BY spend_cents DESC
+      LIMIT 10
+    `);
+
+    const [provs, stats, dist, clients] = await Promise.all([provsP, statsP, distP, clientsP]);
+    const s = stats.rows[0];
+    const distMap = {};
+    for (const d of dist.rows) distMap[d.stars] = d.count;
+    const numOrNull = (v) => (v == null ? null : parseFloat(v));
+
+    res.json({
+      success: true,
+      providers: provs.rows.map((r) => ({
+        providerId: r.provider_id,
+        displayCode: r.display_code,
+        name: r.name,
+        parish: r.parish,
+        cats: r.cats || [],
+        verified: r.verification_status === 'approved' || r.is_verified === true,
+        jobsWon: r.jobs_won,
+        earningsCents: Number(r.earnings_cents),
+        avgRating: numOrNull(r.avg_rating),
+        reviewCount: r.review_count,
+        responseHrs: numOrNull(r.avg_response_hrs),
+        active: r.active === true,
+      })),
+      clients: clients.rows.map((c) => ({
+        name: c.name,
+        displayCode: c.display_code,
+        spendCents: Number(c.spend_cents),
+        jobs: c.jobs,
+        repeat: c.jobs > 1,
+      })),
+      stats: {
+        totalProviders: s.total_providers,
+        verifiedCount: s.verified_count,
+        activeCount: s.active_count,
+        avgRating: numOrNull(s.avg_rating),
+        reviewCount: s.review_count,
+        avgResponseHrs: numOrNull(s.avg_response_hrs),
+        flaggedBelow3: s.flagged_below3,
+        ratingDistribution: [5, 4, 3, 2, 1].map((stars) => ({ stars, count: distMap[stars] || 0 })),
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/admin/providers error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load providers.' });
+  }
+});
+
+// ============================================================
+// GET /api/admin/analytics/supply-demand — supply vs demand analytics.
+// Demand = current open (unawarded, live) tenders. Supply = VERIFIED providers
+// listing that category/parish. Revenue from transactions (JMD cents). Read-only
+// aggregation; db.query (superuser) — route is admin-gated.
+// ============================================================
+router.get('/analytics/supply-demand', async (req, res) => {
+  try {
+    // Canonical "live demand" filter (mirrors GET /tenders/active-count).
+    const DEMAND_FILTER = `
+      t.status = 'open' AND t.trashed_at IS NULL
+      AND (t.expires_at IS NULL OR t.expires_at > NOW())
+      AND NOT EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = t.id AND q.status = 'accepted')`;
+
+    const categoriesP = db.query(`
+      SELECT
+        st.slug,
+        st.display_name                          AS name,
+        st.emoji,
+        COALESCE(d.demand, 0)::int               AS demand,
+        COALESCE(s.providers, 0)::int            AS providers,
+        COALESCE(j.jobs, 0)::int                 AS jobs,
+        COALESCE(j.gmv_cents, 0)::bigint         AS gmv_cents,
+        COALESCE(j.rev_cents, 0)::bigint         AS rev_cents,
+        rt.avg_response_hrs
+      FROM public.service_types st
+      LEFT JOIN (
+        SELECT t.category::text AS cat, COUNT(*) AS demand
+        FROM public.tenders t WHERE ${DEMAND_FILTER} GROUP BY t.category
+      ) d ON d.cat = st.slug
+      LEFT JOIN (
+        SELECT ps.category::text AS cat, COUNT(DISTINCT ps.provider_id) AS providers
+        FROM public.provider_services ps
+        JOIN public.provider_profiles pp ON pp.provider_id = ps.provider_id
+        WHERE pp.verification_status = 'approved'
+        GROUP BY ps.category
+      ) s ON s.cat = st.slug
+      LEFT JOIN (
+        SELECT t.category::text AS cat, COUNT(tx.id) AS jobs,
+               SUM(tx.amount) AS gmv_cents, SUM(tx.platform_fee) AS rev_cents
+        FROM public.transactions tx JOIN public.tenders t ON t.id = tx.tender_id
+        GROUP BY t.category
+      ) j ON j.cat = st.slug
+      LEFT JOIN (
+        SELECT t.category::text AS cat,
+               AVG(EXTRACT(EPOCH FROM (fq.first_at - t.created_at)) / 3600.0) AS avg_response_hrs
+        FROM (SELECT tender_id, MIN(created_at) AS first_at FROM public.quotes GROUP BY tender_id) fq
+        JOIN public.tenders t ON t.id = fq.tender_id
+        GROUP BY t.category
+      ) rt ON rt.cat = st.slug
+      WHERE st.is_active = true
+      ORDER BY st.sort_order
+    `);
+
+    const parishesP = db.query(`
+      SELECT COALESCE(d.parish, s.parish) AS name,
+             COALESCE(d.demand, 0)::int   AS demand,
+             COALESCE(s.providers, 0)::int AS providers
+      FROM (
+        SELECT t.parish, COUNT(*) AS demand
+        FROM public.tenders t WHERE ${DEMAND_FILTER} GROUP BY t.parish
+      ) d
+      FULL OUTER JOIN (
+        SELECT pp.parish, COUNT(DISTINCT pp.provider_id) AS providers
+        FROM public.provider_parishes pp
+        JOIN public.provider_profiles pr ON pr.provider_id = pp.provider_id
+        WHERE pr.verification_status = 'approved'
+        GROUP BY pp.parish
+      ) s ON s.parish = d.parish
+      ORDER BY demand DESC, providers DESC
+    `);
+
+    const [categories, parishes] = await Promise.all([categoriesP, parishesP]);
+    const numOrNull = (v) => (v == null ? null : parseFloat(v));
+
+    res.json({
+      success: true,
+      categories: categories.rows.map((r) => ({
+        slug: r.slug,
+        name: r.name,
+        emoji: r.emoji,
+        demand: r.demand,
+        providers: r.providers,
+        jobs: r.jobs,
+        gmvCents: Number(r.gmv_cents),
+        revCents: Number(r.rev_cents),
+        avgResponseHrs: numOrNull(r.avg_response_hrs),
+      })),
+      parishes: parishes.rows.map((r) => ({
+        name: r.name,
+        demand: r.demand,
+        providers: r.providers,
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/admin/analytics/supply-demand error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load supply/demand analytics.' });
+  }
+});
+
 module.exports = router;
