@@ -7,7 +7,7 @@ const { sendPushToUser } = require('../lib/pushService');
 const { detectPII } = require('../lib/piiFilter');
 const supabase = require('../lib/supabaseClient');
 const { signedUrlMap } = require('../lib/storageUrls');
-const { getActiveRates } = require('../lib/feeConfig');
+const { getActiveRates, getMinFees } = require('../lib/feeConfig');
 
 const router = express.Router();
 
@@ -259,8 +259,17 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
       if (providerRate == null) providerRate = live.providerRate;
     }
     const amount       = row.amount;                              // JMD cents
-    const clientFee    = Math.round((amount * clientRate) / 100);
-    const providerFee  = Math.round((amount * providerRate) / 100);
+    let clientFee      = Math.round((amount * clientRate) / 100);
+    let providerFee    = Math.round((amount * providerRate) / 100);
+    // Minimum-fee floor (guardrail on low-value jobs): if the % fee falls below
+    // the configured minimum, charge the minimum instead. Applied from the
+    // current active config at accept time. See PAYMENTS_AND_JOB_WORKFLOW.md.
+    const minFees = await getMinFees();
+    if (minFees.enabled) {
+      clientFee = Math.max(clientFee, minFees.minClientFee);
+      // Provider floor clamped to the job amount so the payout can't go negative.
+      providerFee = Math.min(Math.max(providerFee, minFees.minProviderFee), amount);
+    }
     const providerPayout = amount - providerFee;
     const platformFee    = clientFee + providerFee;
 

@@ -825,6 +825,10 @@ async function loadFeeConfig() {
       pending_client_effective:   day(c.pending_client_effective),
       pending_provider_rate:      num(c.pending_provider_rate),
       pending_provider_effective: day(c.pending_provider_effective),
+      // Minimum-fee floor (cents) + toggle — managed in Advanced settings.
+      min_fee_enabled:  c.min_fee_enabled !== false,
+      min_client_fee:   c.min_client_fee != null ? parseInt(c.min_client_fee, 10) : 10000,
+      min_provider_fee: c.min_provider_fee != null ? parseInt(c.min_provider_fee, 10) : 10000,
     },
     history: hist.rows.map(shapeFeeHistory),
   };
@@ -973,6 +977,36 @@ router.post('/fee-config/rollback', async (req, res) => {
   } catch (err) {
     console.error('POST /api/admin/fee-config/rollback error:', err);
     res.status(500).json({ success: false, message: 'Failed to roll back fee config.' });
+  }
+});
+
+// PATCH /api/admin/fee-config/minimums { enabled, minClientFee, minProviderFee }
+// Persist the minimum-fee floor (Advanced settings). Amounts are JMD cents.
+router.patch('/fee-config/minimums', async (req, res) => {
+  const { enabled, minClientFee, minProviderFee } = req.body || {};
+  const cents = (v) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+  const mc = cents(minClientFee);
+  const mp = cents(minProviderFee);
+  if (mc === null || mp === null) {
+    return res.status(400).json({ success: false, message: 'Minimum fees must be non-negative amounts.' });
+  }
+  try {
+    await db.query(
+      `UPDATE public.platform_fee_config
+         SET min_fee_enabled = $1, min_client_fee = $2, min_provider_fee = $3, updated_at = NOW()
+       WHERE id = 1`,
+      [enabled !== false, mc, mp]
+    );
+    const out = await loadFeeConfig();
+    res.json({ success: true, ...out });
+    // Nudge open clients to refresh fee data (incl. the new minimums via /api/fees).
+    notifyChannel('platform-fees', 'fees-updated', {});
+  } catch (err) {
+    console.error('PATCH /api/admin/fee-config/minimums error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update minimum fees.' });
   }
 });
 
