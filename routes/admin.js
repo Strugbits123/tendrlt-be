@@ -9,6 +9,12 @@ const {
 } = require('../lib/verificationEmails');
 const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendTenderRemovedEmail } = require('../lib/tenderEmails');
+const { signedUrl } = require('../lib/storageUrls');
+const {
+  sendDisputeResolvedClientEmail,
+  sendDisputeResolvedProviderEmail,
+} = require('../lib/disputeEmails');
+const { jamaicaToday } = require('../lib/feeConfig');
 
 const router = express.Router();
 
@@ -807,12 +813,22 @@ async function loadFeeConfig() {
     `),
   ]);
   const c = cfg.rows[0] || {};
+  const day = (v) => (v ? new Date(v).toISOString().slice(0, 10) : null);
   return {
     config: {
       client_rate:   num(c.client_rate),
       provider_rate: num(c.provider_rate),
-      client_effective:   c.client_effective ? new Date(c.client_effective).toISOString().slice(0, 10) : null,
-      provider_effective: c.provider_effective ? new Date(c.provider_effective).toISOString().slice(0, 10) : null,
+      client_effective:   day(c.client_effective),
+      provider_effective: day(c.provider_effective),
+      // Scheduled (pending) changes not yet in effect — null when none.
+      pending_client_rate:        num(c.pending_client_rate),
+      pending_client_effective:   day(c.pending_client_effective),
+      pending_provider_rate:      num(c.pending_provider_rate),
+      pending_provider_effective: day(c.pending_provider_effective),
+      // Minimum-fee floor (cents) + toggle — managed in Advanced settings.
+      min_fee_enabled:  c.min_fee_enabled !== false,
+      min_client_fee:   c.min_client_fee != null ? parseInt(c.min_client_fee, 10) : 10000,
+      min_provider_fee: c.min_provider_fee != null ? parseInt(c.min_provider_fee, 10) : 10000,
     },
     history: hist.rows.map(shapeFeeHistory),
   };
@@ -857,11 +873,27 @@ router.patch('/fee-config', async (req, res) => {
     const newClient = side === 'client' ? r : oldClient;
     const newProvider = side === 'provider' ? r : oldProvider;
 
-    // side is validated to a fixed literal above — safe to interpolate the column.
-    await db.query(
-      `UPDATE public.platform_fee_config SET ${side}_rate = $1, ${side}_effective = $2, updated_at = NOW() WHERE id = 1`,
-      [r, effective]
-    );
+    // A change effective TODAY or earlier (Jamaica) applies now; a FUTURE date
+    // is parked in the pending slot and activated by the daily job on its date.
+    // (side is validated to a fixed literal above — safe to interpolate.)
+    const applyNow = String(effective) <= jamaicaToday();
+    if (applyNow) {
+      await db.query(
+        `UPDATE public.platform_fee_config
+            SET ${side}_rate = $1, ${side}_effective = $2,
+                pending_${side}_rate = NULL, pending_${side}_effective = NULL,
+                updated_at = NOW()
+          WHERE id = 1`,
+        [r, effective]
+      );
+    } else {
+      await db.query(
+        `UPDATE public.platform_fee_config
+            SET pending_${side}_rate = $1, pending_${side}_effective = $2, updated_at = NOW()
+          WHERE id = 1`,
+        [r, effective]
+      );
+    }
     await db.query(
       `UPDATE public.fee_change_history SET status = 'superseded' WHERE status = 'active' AND (type = $1 OR type = 'both')`,
       [side]
@@ -875,8 +907,9 @@ router.patch('/fee-config', async (req, res) => {
     );
 
     const out = await loadFeeConfig();
-    res.json({ success: true, ...out });
-    broadcastFees(out.config);
+    res.json({ success: true, ...out, scheduled: !applyNow });
+    // Only broadcast a live rate change when it actually took effect now.
+    if (applyNow) broadcastFees(out.config);
   } catch (err) {
     console.error('PATCH /api/admin/fee-config error:', err);
     res.status(500).json({ success: false, message: 'Failed to update fee config.' });
@@ -914,10 +947,10 @@ router.post('/fee-config/rollback', async (req, res) => {
     }
 
     if (doClient) {
-      await db.query(`UPDATE public.platform_fee_config SET client_rate = $1, client_effective = CURRENT_DATE, updated_at = NOW() WHERE id = 1`, [newClient]);
+      await db.query(`UPDATE public.platform_fee_config SET client_rate = $1, client_effective = CURRENT_DATE, pending_client_rate = NULL, pending_client_effective = NULL, updated_at = NOW() WHERE id = 1`, [newClient]);
     }
     if (doProvider) {
-      await db.query(`UPDATE public.platform_fee_config SET provider_rate = $1, provider_effective = CURRENT_DATE, updated_at = NOW() WHERE id = 1`, [newProvider]);
+      await db.query(`UPDATE public.platform_fee_config SET provider_rate = $1, provider_effective = CURRENT_DATE, pending_provider_rate = NULL, pending_provider_effective = NULL, updated_at = NOW() WHERE id = 1`, [newProvider]);
     }
 
     // Supersede the active entries for the rolled-back side(s).
@@ -944,6 +977,36 @@ router.post('/fee-config/rollback', async (req, res) => {
   } catch (err) {
     console.error('POST /api/admin/fee-config/rollback error:', err);
     res.status(500).json({ success: false, message: 'Failed to roll back fee config.' });
+  }
+});
+
+// PATCH /api/admin/fee-config/minimums { enabled, minClientFee, minProviderFee }
+// Persist the minimum-fee floor (Advanced settings). Amounts are JMD cents.
+router.patch('/fee-config/minimums', async (req, res) => {
+  const { enabled, minClientFee, minProviderFee } = req.body || {};
+  const cents = (v) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+  const mc = cents(minClientFee);
+  const mp = cents(minProviderFee);
+  if (mc === null || mp === null) {
+    return res.status(400).json({ success: false, message: 'Minimum fees must be non-negative amounts.' });
+  }
+  try {
+    await db.query(
+      `UPDATE public.platform_fee_config
+         SET min_fee_enabled = $1, min_client_fee = $2, min_provider_fee = $3, updated_at = NOW()
+       WHERE id = 1`,
+      [enabled !== false, mc, mp]
+    );
+    const out = await loadFeeConfig();
+    res.json({ success: true, ...out });
+    // Nudge open clients to refresh fee data (incl. the new minimums via /api/fees).
+    notifyChannel('platform-fees', 'fees-updated', {});
+  } catch (err) {
+    console.error('PATCH /api/admin/fee-config/minimums error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update minimum fees.' });
   }
 });
 
@@ -1020,6 +1083,458 @@ router.get('/revenue', async (req, res) => {
   } catch (err) {
     console.error('GET /api/admin/revenue error:', err);
     res.status(500).json({ success: false, message: 'Failed to load revenue.' });
+  }
+});
+
+// ============================================================
+// Disputes — admin review & resolution console.
+// See documentation/PAYMENTS_AND_JOB_WORKFLOW.md ("Disputes").
+// ============================================================
+
+// How admins can resolve a dispute → the escrow status we record. WiPay is
+// deferred, so no money actually moves; the disputes row is the authoritative
+// record of the outcome (incl. the "split" nuance the enum can't express).
+const RESOLUTION_TX_STATUS = {
+  refund: 'refunded',   // client made whole
+  release: 'completed', // provider paid out
+  split: 'completed',   // partial each way; recorded on the dispute row
+};
+
+// GET /api/admin/disputes
+// Every dispute with its transaction, tender, service, parish, both parties,
+// the two-sided fee breakdown, and a signed URL for the evidence photo.
+router.get('/disputes', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        d.id,
+        d.category,
+        d.description,
+        d.image_path,
+        d.status,
+        d.resolution,
+        d.resolution_notes,
+        d.created_at,
+        d.resolved_at,
+        d.client_id,
+        d.provider_id,
+        tx.quote_id,
+        t.display_code,
+        t.parish,
+        t.created_at                         AS tender_created_at,
+        st.display_name                      AS service_name,
+        cu.first_name                        AS client_first_name,
+        cu.last_name                         AS client_last_name,
+        pu.first_name                        AS provider_first_name,
+        pu.last_name                         AS provider_last_name,
+        ru.first_name                        AS resolver_first_name,
+        ru.last_name                         AS resolver_last_name,
+        tx.amount,
+        tx.client_fee,
+        tx.provider_fee,
+        tx.platform_fee,
+        tx.provider_payout,
+        tx.status                            AS transaction_status,
+        tx.created_at                        AS accepted_at,
+        tx.provider_completed_at
+      FROM public.disputes d
+      JOIN public.transactions tx ON tx.id = d.transaction_id
+      JOIN public.tenders t       ON t.id = tx.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users cu        ON cu.id = d.client_id
+      JOIN public.users pu        ON pu.id = d.provider_id
+      LEFT JOIN public.users ru   ON ru.id = d.resolved_by
+      ORDER BY (d.status = 'open') DESC, d.created_at DESC
+    `);
+
+    // The 1:1 chat is scoped to the quote (transactions.quote_id → messages).
+    // Admins may read all messages (messages_select_admin RLS) for dispute
+    // resolution. Fetch every relevant conversation in one query and group by
+    // quote so we can attach a transcript to each dispute.
+    const quoteIds = [...new Set(result.rows.map((r) => r.quote_id).filter(Boolean))];
+    const chatByQuote = new Map();
+    if (quoteIds.length) {
+      const msgs = await db.query(
+        `SELECT quote_id, sender_id, body, created_at
+           FROM public.messages
+          WHERE quote_id = ANY($1::uuid[])
+          ORDER BY created_at ASC`,
+        [quoteIds]
+      );
+      for (const m of msgs.rows) {
+        if (!chatByQuote.has(m.quote_id)) chatByQuote.set(m.quote_id, []);
+        chatByQuote.get(m.quote_id).push(m);
+      }
+    }
+
+    // Sign evidence photos (private tender-media bucket).
+    const disputes = await Promise.all(
+      result.rows.map(async (r) => ({
+        id: r.id,
+        displayCode: r.display_code,
+        job: r.service_name || 'Service job',
+        category: r.category,
+        parish: r.parish,
+        description: r.description,
+        evidenceUrl: await signedUrl(supabase, 'tender-media', r.image_path),
+        chat: (chatByQuote.get(r.quote_id) || []).map((m) => ({
+          role: m.sender_id === r.client_id ? 'client' : m.sender_id === r.provider_id ? 'provider' : 'system',
+          body: m.body,
+          createdAt: m.created_at,
+        })),
+        status: r.status,
+        resolution: r.resolution,
+        resolutionNotes: r.resolution_notes,
+        client: { firstName: r.client_first_name, lastName: r.client_last_name },
+        provider: { firstName: r.provider_first_name, lastName: r.provider_last_name },
+        resolver:
+          r.resolver_first_name || r.resolver_last_name
+            ? { firstName: r.resolver_first_name, lastName: r.resolver_last_name }
+            : null,
+        amount: r.amount,
+        clientFee: r.client_fee,
+        providerFee: r.provider_fee,
+        platformFee: r.platform_fee,
+        providerPayout: r.provider_payout,
+        transactionStatus: r.transaction_status,
+        tenderCreatedAt: r.tender_created_at,
+        acceptedAt: r.accepted_at,
+        providerCompletedAt: r.provider_completed_at,
+        createdAt: r.created_at,
+        resolvedAt: r.resolved_at,
+      }))
+    );
+
+    // Dispute rate needs the denominator: total accepted (transacted) jobs.
+    const totals = await db.query(
+      `SELECT COUNT(*)::int AS transacted FROM public.transactions`
+    );
+
+    res.json({
+      success: true,
+      disputes,
+      stats: { transactedJobs: totals.rows[0].transacted },
+    });
+  } catch (err) {
+    console.error('GET /api/admin/disputes error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load disputes.' });
+  }
+});
+
+// POST /api/admin/disputes/:id/resolve   { resolution, notes? }
+// Resolve an open dispute: record the outcome + note + resolver, advance the
+// escrow status, and notify both parties (email + realtime + bell).
+router.post('/disputes/:id/resolve', async (req, res) => {
+  const { id } = req.params;
+  const resolution = typeof req.body.resolution === 'string' ? req.body.resolution : '';
+  const notes = typeof req.body.notes === 'string' ? req.body.notes.trim() : '';
+  const txStatus = RESOLUTION_TX_STATUS[resolution];
+  if (!txStatus) {
+    return res.status(400).json({ success: false, message: 'Invalid resolution. Use refund, release, or split.' });
+  }
+  try {
+    const ctx = await db.query(`
+      SELECT d.id, d.status, d.transaction_id, d.client_id, d.provider_id,
+             st.display_name AS service_name,
+             tx.amount, tx.client_fee, tx.provider_payout,
+             cu.email AS client_email, (cu.first_name || ' ' || cu.last_name) AS client_name,
+             pu.email AS provider_email, (pu.first_name || ' ' || pu.last_name) AS provider_name,
+             t.id AS tender_id
+      FROM public.disputes d
+      JOIN public.transactions tx ON tx.id = d.transaction_id
+      JOIN public.tenders t       ON t.id = tx.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users cu        ON cu.id = d.client_id
+      JOIN public.users pu        ON pu.id = d.provider_id
+      WHERE d.id = $1
+    `, [id]);
+
+    if (ctx.rows.length === 0) return res.status(404).json({ success: false, message: 'Dispute not found.' });
+    const row = ctx.rows[0];
+    if (row.status !== 'open') {
+      return res.status(409).json({ success: false, message: 'This dispute has already been resolved.' });
+    }
+
+    await db.query(
+      `UPDATE public.disputes
+         SET status = 'resolved', resolution = $1, resolution_notes = $2,
+             resolved_by = $3, resolved_at = NOW()
+       WHERE id = $4`,
+      [resolution, notes || null, req.user.id, id]
+    );
+    await db.query(
+      `UPDATE public.transactions
+         SET status = $1::transaction_status,
+             completed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE completed_at END,
+             updated_at = NOW()
+       WHERE id = $2`,
+      [txStatus, row.transaction_id]
+    );
+    // Resolving a dispute closes the job: the tender leaves in_progress so it
+    // drops out of the homeowner's "In Progress" and the provider's "Won"
+    // buckets and lands in "Completed" for both. (Refund still records the
+    // outcome on the dispute/transaction; there is no separate cancelled state.)
+    await db.query(
+      `UPDATE public.tenders SET status = 'completed', updated_at = NOW() WHERE id = $1`,
+      [row.tender_id]
+    );
+
+    res.json({ success: true });
+
+    // ── Fire-and-forget: notify both parties ─────────────────────────────
+    (async () => {
+      const serviceName = row.service_name || 'the job';
+      // Amount surfaced to each party depends on the outcome.
+      const clientTotalCents = (row.amount || 0) + (row.client_fee || 0);
+      const fmt = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
+      const clientAmt =
+        resolution === 'refund' ? fmt(clientTotalCents)
+        : resolution === 'split' ? fmt(Math.round(clientTotalCents / 2))
+        : null;
+      const providerAmt =
+        resolution === 'release' ? fmt(row.provider_payout)
+        : resolution === 'split' ? fmt(Math.round((row.provider_payout || 0) / 2))
+        : null;
+
+      const outcomeLabel = {
+        refund: 'The homeowner has been fully refunded.',
+        release: 'The payout has been released to the provider.',
+        split: 'A split resolution was applied (partial refund + partial payout).',
+      }[resolution];
+
+      const tasks = [
+        sendDisputeResolvedClientEmail(row.client_email, {
+          clientName: row.client_name, tenderTitle: serviceName, resolution, amountLabel: clientAmt, notes,
+        }),
+        sendDisputeResolvedProviderEmail(row.provider_email, {
+          providerName: row.provider_name, tenderTitle: serviceName, resolution, amountLabel: providerAmt, notes,
+        }),
+        notifyUser(row.client_id, 'dispute-resolved', { tenderId: row.tender_id }),
+        notifyUser(row.provider_id, 'dispute-resolved', { tenderId: row.tender_id }),
+        db.query(
+          `INSERT INTO public.notifications (user_id, type, title, body, data)
+           VALUES ($1, 'dispute_resolved', $2, $3, $4::jsonb),
+                  ($5, 'dispute_resolved', $6, $7, $4::jsonb)`,
+          [
+            row.client_id, `Your dispute on "${serviceName}" was resolved`, outcomeLabel,
+            JSON.stringify({ tenderId: row.tender_id }),
+            row.provider_id, `The dispute on "${serviceName}" was resolved`, outcomeLabel,
+          ]
+        ),
+        notifyChannel('admin-disputes', 'dispute-resolved', { disputeId: id }),
+      ];
+      await Promise.allSettled(tasks);
+    })().catch((err) => console.warn('POST /admin/disputes/:id/resolve — side-effect error:', err.message));
+  } catch (err) {
+    console.error('POST /api/admin/disputes/:id/resolve error:', err);
+    res.status(500).json({ success: false, message: 'Failed to resolve the dispute.' });
+  }
+});
+
+// ============================================================
+// GET /api/admin/providers — analytics for the admin Providers screen.
+// Read-only aggregation across users/provider_profiles/quotes/transactions/
+// reviews. Money in JMD cents. db.query (superuser) — route is admin-gated.
+// ============================================================
+router.get('/providers', async (req, res) => {
+  try {
+    const provsP = db.query(`
+      SELECT
+        u.id                                    AS provider_id,
+        u.display_code,
+        (u.first_name || ' ' || u.last_name)    AS name,
+        u.parish,
+        pp.verification_status,
+        COALESCE(pp.is_verified, false)         AS is_verified,
+        COALESCE(jw.jobs_won, 0)::int           AS jobs_won,
+        COALESCE(er.earnings_cents, 0)::bigint  AS earnings_cents,
+        rv.avg_rating,
+        COALESCE(rv.review_count, 0)::int       AS review_count,
+        rt.avg_response_hrs,
+        COALESCE(cats.cats, ARRAY[]::text[])    AS cats,
+        (COALESCE(rq.recent_quotes, 0) > 0)     AS active
+      FROM public.users u
+      LEFT JOIN public.provider_profiles pp ON pp.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, COUNT(*) AS jobs_won FROM public.quotes WHERE status = 'accepted' GROUP BY provider_id) jw ON jw.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, SUM(provider_payout) AS earnings_cents FROM public.transactions GROUP BY provider_id) er ON er.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, AVG(rating) AS avg_rating, COUNT(*) AS review_count FROM public.reviews GROUP BY provider_id) rv ON rv.provider_id = u.id
+      LEFT JOIN (SELECT q.provider_id, AVG(EXTRACT(EPOCH FROM (q.created_at - t.created_at)) / 3600.0) AS avg_response_hrs
+                 FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id GROUP BY q.provider_id) rt ON rt.provider_id = u.id
+      LEFT JOIN (SELECT ps.provider_id, ARRAY_AGG(DISTINCT st.display_name) AS cats
+                 FROM public.provider_services ps JOIN public.service_types st ON st.id = ps.service_type_id GROUP BY ps.provider_id) cats ON cats.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, COUNT(*) AS recent_quotes FROM public.quotes WHERE created_at >= NOW() - INTERVAL '30 days' GROUP BY provider_id) rq ON rq.provider_id = u.id
+      WHERE u.role = 'provider'
+      ORDER BY jobs_won DESC, earnings_cents DESC
+    `);
+
+    const statsP = db.query(`
+      SELECT
+        (SELECT COUNT(*) FROM public.users WHERE role = 'provider')::int AS total_providers,
+        (SELECT COUNT(*) FROM public.provider_profiles WHERE verification_status = 'approved')::int AS verified_count,
+        (SELECT COUNT(DISTINCT provider_id) FROM public.quotes WHERE created_at >= NOW() - INTERVAL '30 days')::int AS active_count,
+        (SELECT AVG(rating) FROM public.reviews) AS avg_rating,
+        (SELECT COUNT(*) FROM public.reviews)::int AS review_count,
+        (SELECT AVG(EXTRACT(EPOCH FROM (q.created_at - t.created_at)) / 3600.0)
+           FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id) AS avg_response_hrs,
+        (SELECT COUNT(*) FROM (SELECT provider_id FROM public.reviews GROUP BY provider_id HAVING AVG(rating) < 3) x)::int AS flagged_below3
+    `);
+
+    const distP = db.query(`SELECT rating AS stars, COUNT(*)::int AS count FROM public.reviews GROUP BY rating`);
+
+    const clientsP = db.query(`
+      SELECT u.display_code, (u.first_name || ' ' || u.last_name) AS name,
+             SUM(tx.amount + tx.client_fee)::bigint AS spend_cents,
+             COUNT(*)::int AS jobs
+      FROM public.transactions tx
+      JOIN public.users u ON u.id = tx.client_id
+      GROUP BY u.id, u.display_code, name
+      ORDER BY spend_cents DESC
+      LIMIT 10
+    `);
+
+    const [provs, stats, dist, clients] = await Promise.all([provsP, statsP, distP, clientsP]);
+    const s = stats.rows[0];
+    const distMap = {};
+    for (const d of dist.rows) distMap[d.stars] = d.count;
+    const numOrNull = (v) => (v == null ? null : parseFloat(v));
+
+    res.json({
+      success: true,
+      providers: provs.rows.map((r) => ({
+        providerId: r.provider_id,
+        displayCode: r.display_code,
+        name: r.name,
+        parish: r.parish,
+        cats: r.cats || [],
+        verified: r.verification_status === 'approved' || r.is_verified === true,
+        jobsWon: r.jobs_won,
+        earningsCents: Number(r.earnings_cents),
+        avgRating: numOrNull(r.avg_rating),
+        reviewCount: r.review_count,
+        responseHrs: numOrNull(r.avg_response_hrs),
+        active: r.active === true,
+      })),
+      clients: clients.rows.map((c) => ({
+        name: c.name,
+        displayCode: c.display_code,
+        spendCents: Number(c.spend_cents),
+        jobs: c.jobs,
+        repeat: c.jobs > 1,
+      })),
+      stats: {
+        totalProviders: s.total_providers,
+        verifiedCount: s.verified_count,
+        activeCount: s.active_count,
+        avgRating: numOrNull(s.avg_rating),
+        reviewCount: s.review_count,
+        avgResponseHrs: numOrNull(s.avg_response_hrs),
+        flaggedBelow3: s.flagged_below3,
+        ratingDistribution: [5, 4, 3, 2, 1].map((stars) => ({ stars, count: distMap[stars] || 0 })),
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/admin/providers error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load providers.' });
+  }
+});
+
+// ============================================================
+// GET /api/admin/analytics/supply-demand — supply vs demand analytics.
+// Demand = current open (unawarded, live) tenders. Supply = VERIFIED providers
+// listing that category/parish. Revenue from transactions (JMD cents). Read-only
+// aggregation; db.query (superuser) — route is admin-gated.
+// ============================================================
+router.get('/analytics/supply-demand', async (req, res) => {
+  try {
+    // Canonical "live demand" filter (mirrors GET /tenders/active-count).
+    const DEMAND_FILTER = `
+      t.status = 'open' AND t.trashed_at IS NULL
+      AND (t.expires_at IS NULL OR t.expires_at > NOW())
+      AND NOT EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = t.id AND q.status = 'accepted')`;
+
+    const categoriesP = db.query(`
+      SELECT
+        st.slug,
+        st.display_name                          AS name,
+        st.emoji,
+        COALESCE(d.demand, 0)::int               AS demand,
+        COALESCE(s.providers, 0)::int            AS providers,
+        COALESCE(j.jobs, 0)::int                 AS jobs,
+        COALESCE(j.gmv_cents, 0)::bigint         AS gmv_cents,
+        COALESCE(j.rev_cents, 0)::bigint         AS rev_cents,
+        rt.avg_response_hrs
+      FROM public.service_types st
+      LEFT JOIN (
+        SELECT t.category::text AS cat, COUNT(*) AS demand
+        FROM public.tenders t WHERE ${DEMAND_FILTER} GROUP BY t.category
+      ) d ON d.cat = st.slug
+      LEFT JOIN (
+        SELECT ps.category::text AS cat, COUNT(DISTINCT ps.provider_id) AS providers
+        FROM public.provider_services ps
+        JOIN public.provider_profiles pp ON pp.provider_id = ps.provider_id
+        WHERE pp.verification_status = 'approved'
+        GROUP BY ps.category
+      ) s ON s.cat = st.slug
+      LEFT JOIN (
+        SELECT t.category::text AS cat, COUNT(tx.id) AS jobs,
+               SUM(tx.amount) AS gmv_cents, SUM(tx.platform_fee) AS rev_cents
+        FROM public.transactions tx JOIN public.tenders t ON t.id = tx.tender_id
+        GROUP BY t.category
+      ) j ON j.cat = st.slug
+      LEFT JOIN (
+        SELECT t.category::text AS cat,
+               AVG(EXTRACT(EPOCH FROM (fq.first_at - t.created_at)) / 3600.0) AS avg_response_hrs
+        FROM (SELECT tender_id, MIN(created_at) AS first_at FROM public.quotes GROUP BY tender_id) fq
+        JOIN public.tenders t ON t.id = fq.tender_id
+        GROUP BY t.category
+      ) rt ON rt.cat = st.slug
+      WHERE st.is_active = true
+      ORDER BY st.sort_order
+    `);
+
+    const parishesP = db.query(`
+      SELECT COALESCE(d.parish, s.parish) AS name,
+             COALESCE(d.demand, 0)::int   AS demand,
+             COALESCE(s.providers, 0)::int AS providers
+      FROM (
+        SELECT t.parish, COUNT(*) AS demand
+        FROM public.tenders t WHERE ${DEMAND_FILTER} GROUP BY t.parish
+      ) d
+      FULL OUTER JOIN (
+        SELECT pp.parish, COUNT(DISTINCT pp.provider_id) AS providers
+        FROM public.provider_parishes pp
+        JOIN public.provider_profiles pr ON pr.provider_id = pp.provider_id
+        WHERE pr.verification_status = 'approved'
+        GROUP BY pp.parish
+      ) s ON s.parish = d.parish
+      ORDER BY demand DESC, providers DESC
+    `);
+
+    const [categories, parishes] = await Promise.all([categoriesP, parishesP]);
+    const numOrNull = (v) => (v == null ? null : parseFloat(v));
+
+    res.json({
+      success: true,
+      categories: categories.rows.map((r) => ({
+        slug: r.slug,
+        name: r.name,
+        emoji: r.emoji,
+        demand: r.demand,
+        providers: r.providers,
+        jobs: r.jobs,
+        gmvCents: Number(r.gmv_cents),
+        revCents: Number(r.rev_cents),
+        avgResponseHrs: numOrNull(r.avg_response_hrs),
+      })),
+      parishes: parishes.rows.map((r) => ({
+        name: r.name,
+        demand: r.demand,
+        providers: r.providers,
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/admin/analytics/supply-demand error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load supply/demand analytics.' });
   }
 });
 

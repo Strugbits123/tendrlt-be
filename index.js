@@ -64,10 +64,14 @@ app.use((err, req, res, next) => {
 });
 
 // Start Server
+const { startFeeScheduler } = require('./lib/feeScheduler');
+
 app.listen(PORT, () => {
   console.log(`=========================================`);
   console.log(`  TendrIt Auth Backend Service started   `);
   console.log(`  Listening on port: ${PORT}             `);
   console.log(`  Allowed Origin: ${FRONTEND_URL}        `);
   console.log(`=========================================`);
+  // Activate any due scheduled platform-fee change now, then daily at 00:05 Jamaica.
+  startFeeScheduler();
 });
