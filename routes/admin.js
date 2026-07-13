@@ -15,6 +15,7 @@ const {
   sendDisputeResolvedProviderEmail,
 } = require('../lib/disputeEmails');
 const { jamaicaToday } = require('../lib/feeConfig');
+const paymentCrypto = require('../lib/paymentCrypto');
 
 const router = express.Router();
 
@@ -79,7 +80,11 @@ router.get('/verifications', async (req, res) => {
              FROM public.provider_parishes pa
             WHERE pa.provider_id = u.id),
           '[]'::json
-        ) AS parishes
+        ) AS parishes,
+        EXISTS (
+          SELECT 1 FROM public.provider_payment_details pd
+           WHERE pd.provider_id = u.id AND pd.account_number_encrypted IS NOT NULL
+        ) AS has_payment_details
       FROM public.provider_profiles p
       JOIN public.users u ON u.id = p.provider_id
       WHERE p.is_onboarding_complete = TRUE
@@ -106,6 +111,7 @@ router.get('/verifications', async (req, res) => {
         // resubmission — the admin sees why it was rejected last time.
         previouslyRejected: Boolean(r.resubmitted_at) && Boolean(r.rejection_reason),
         adminNotes:         r.admin_notes || '',
+        hasPaymentDetails:  Boolean(r.has_payment_details),
         docs: DOC_TYPES.map(d => ({
           docType:  d.docType,
           name:     d.name,
@@ -192,6 +198,67 @@ router.get('/verifications/:providerId/document/:docType', async (req, res) => {
   } catch (err) {
     console.error('GET document signed-url error:', err);
     res.status(500).json({ success: false, message: 'Failed to load document.' });
+  }
+});
+
+// ============================================================
+// GET /api/admin/verifications/:providerId/payment
+// Returns the provider's FULL, decrypted payout details for verification.
+// Decryption happens on-demand (only when an admin explicitly opens the
+// banking panel) to minimise how often plaintext exists in memory.
+// Admin-only (router.use gate). Read via superuser db.query.
+// ============================================================
+router.get('/verifications/:providerId/payment', async (req, res) => {
+  const { providerId } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT account_ownership, business_name, payee_first_name, payee_surname,
+              bank_name, bank_branch, swift_code, transit_code, bank_address,
+              account_type, currency, account_number_encrypted, aba_routing_encrypted
+         FROM public.provider_payment_details
+        WHERE provider_id = $1`,
+      [providerId]
+    );
+
+    const r = result.rows[0];
+    if (!r) {
+      return res.status(404).json({ success: false, message: 'No payment details on file.' });
+    }
+
+    let accountNumber = null;
+    let abaRouting = null;
+    try {
+      accountNumber = paymentCrypto.decrypt(r.account_number_encrypted);
+      abaRouting = paymentCrypto.decrypt(r.aba_routing_encrypted);
+    } catch (decErr) {
+      console.error('Payment decrypt failed for provider', providerId, decErr.message);
+      return res.status(500).json({
+        success: false,
+        message: 'Could not decrypt payment details. Check PAYMENT_ENCRYPTION_KEY.',
+      });
+    }
+
+    res.json({
+      success: true,
+      payment: {
+        accountOwnership: r.account_ownership,
+        businessName:     r.business_name,
+        payeeFirstName:   r.payee_first_name,
+        payeeSurname:     r.payee_surname,
+        bankName:         r.bank_name,
+        bankBranch:       r.bank_branch,
+        swiftCode:        r.swift_code,
+        transitCode:      r.transit_code,
+        bankAddress:      r.bank_address,
+        accountType:      r.account_type,
+        currency:         r.currency,
+        accountNumber,   // decrypted
+        abaRouting,      // decrypted (may be null)
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/admin/verifications/:providerId/payment error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load payment details.' });
   }
 });
 
