@@ -6,6 +6,7 @@ const supabase = require('../lib/supabaseClient');
 const { authenticate, authorize } = require('../middleware/auth');
 const { notifyChannel } = require('../lib/realtimeService');
 const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
+const paymentCrypto = require('../lib/paymentCrypto');
 
 const router = express.Router();
 
@@ -484,9 +485,167 @@ router.get('/earnings', authenticate, authorize('provider'), async (req, res) =>
 });
 
 // ============================================================
+// GET /api/providers/payment
+// Returns the logged-in provider's saved payout details, MASKED.
+// The full account number and ABA are NEVER returned here — only the last 4
+// digits of the account number, so the UI can render "••••4321". To change
+// the account number the provider must re-enter it.
+// ============================================================
+router.get('/payment', authenticate, authorize('provider'), async (req, res) => {
+  try {
+    const result = await db.queryAsUser(req.user.id,
+      `SELECT account_ownership, business_name, payee_first_name, payee_surname,
+              bank_name, bank_branch, swift_code, transit_code, bank_address,
+              account_type, currency, account_number_last4,
+              (aba_routing_encrypted IS NOT NULL) AS has_aba
+         FROM public.provider_payment_details
+        WHERE provider_id = $1`,
+      [req.user.id]
+    );
+
+    const row = result.rows[0] || null;
+    res.json({ success: true, payment: row });
+  } catch (err) {
+    console.error('GET /api/providers/payment error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load payment details.' });
+  }
+});
+
+// ============================================================
+// PUT /api/providers/payment
+// Upserts the provider's payout details. The account number and ABA/routing
+// number are encrypted (AES-256-GCM) BEFORE they touch the database; only
+// ciphertext + the last 4 digits are stored. All fields except ABA are required.
+// ============================================================
+router.put('/payment', authenticate, authorize('provider'), async (req, res) => {
+  const {
+    account_ownership,
+    business_name,
+    payee_first_name,
+    payee_surname,
+    bank_name,
+    bank_branch,
+    swift_code,
+    transit_code,
+    bank_address,
+    account_type,
+    currency,
+    account_number,   // raw — encrypted here, never stored in the clear
+    aba_routing,      // raw, optional
+  } = req.body;
+
+  const ownership = account_ownership === 'business' ? 'business' : 'personal';
+  const acctNumClean = account_number != null ? String(account_number).replace(/\s/g, '') : '';
+
+  try {
+    // Does a row already exist? Governs whether account_number may be omitted
+    // (masked readback means the client re-enters the number only to change it).
+    const existing = await db.queryAsUser(req.user.id,
+      `SELECT 1 FROM public.provider_payment_details WHERE provider_id = $1`,
+      [req.user.id]
+    );
+    const hasRow = existing.rows.length > 0;
+
+    // ── Validation ──
+    const errors = [];
+    if (!payee_first_name || !String(payee_first_name).trim()) errors.push('payee first name');
+    if (!payee_surname || !String(payee_surname).trim())       errors.push('payee surname');
+    if (!bank_name || !String(bank_name).trim())               errors.push('bank name');
+    if (!account_type || !String(account_type).trim())         errors.push('account type');
+    if (!acctNumClean && !hasRow)                              errors.push('account number');
+    if (ownership === 'business' && (!business_name || !String(business_name).trim()))
+      errors.push('registered business name');
+
+    if (errors.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Please provide: ${errors.join(', ')}.`,
+      });
+    }
+
+    const abaEnc = aba_routing && String(aba_routing).trim()
+      ? paymentCrypto.encrypt(String(aba_routing).replace(/\s/g, ''))
+      : null;
+
+    const commonParams = [
+      req.user.id,
+      ownership,
+      ownership === 'business' ? String(business_name).trim() : null,
+      String(payee_first_name).trim(),
+      String(payee_surname).trim(),
+      String(bank_name).trim(),
+      bank_branch ? String(bank_branch).trim() : null,
+      swift_code ? String(swift_code).trim() : null,
+      transit_code ? String(transit_code).trim() : null,
+      bank_address ? String(bank_address).trim() : null,
+      String(account_type).trim(),
+      currency ? String(currency).trim() : 'jmd',
+      abaEnc,
+    ];
+
+    if (acctNumClean) {
+      // New / changed account number → (re)encrypt it.
+      const acctEnc = paymentCrypto.encrypt(acctNumClean);
+      const last4   = paymentCrypto.last4(acctNumClean);
+      await db.queryAsUser(req.user.id,
+        `INSERT INTO public.provider_payment_details
+           (provider_id, account_ownership, business_name, payee_first_name, payee_surname,
+            bank_name, bank_branch, swift_code, transit_code, bank_address,
+            account_type, currency, aba_routing_encrypted,
+            account_number_encrypted, account_number_last4)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT (provider_id) DO UPDATE SET
+            account_ownership        = EXCLUDED.account_ownership,
+            business_name            = EXCLUDED.business_name,
+            payee_first_name         = EXCLUDED.payee_first_name,
+            payee_surname            = EXCLUDED.payee_surname,
+            bank_name                = EXCLUDED.bank_name,
+            bank_branch              = EXCLUDED.bank_branch,
+            swift_code               = EXCLUDED.swift_code,
+            transit_code             = EXCLUDED.transit_code,
+            bank_address             = EXCLUDED.bank_address,
+            account_type             = EXCLUDED.account_type,
+            currency                 = EXCLUDED.currency,
+            aba_routing_encrypted    = EXCLUDED.aba_routing_encrypted,
+            account_number_encrypted = EXCLUDED.account_number_encrypted,
+            account_number_last4     = EXCLUDED.account_number_last4,
+            updated_at               = NOW()`,
+        [...commonParams, acctEnc, last4]
+      );
+    } else {
+      // No number supplied → update everything else, keep the stored ciphertext.
+      await db.queryAsUser(req.user.id,
+        `UPDATE public.provider_payment_details SET
+            account_ownership     = $2,
+            business_name         = $3,
+            payee_first_name      = $4,
+            payee_surname         = $5,
+            bank_name             = $6,
+            bank_branch           = $7,
+            swift_code            = $8,
+            transit_code          = $9,
+            bank_address          = $10,
+            account_type          = $11,
+            currency              = $12,
+            aba_routing_encrypted = $13,
+            updated_at            = NOW()
+          WHERE provider_id = $1`,
+        commonParams
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PUT /api/providers/payment error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save payment details.' });
+  }
+});
+
+// ============================================================
 // POST /api/providers/go-live
 // Sets is_onboarding_complete = TRUE on the provider's profile.
-// Only succeeds if a profile row already exists (step 1 must be saved first).
+// Only succeeds if a profile row already exists (step 1 must be saved first)
+// AND the provider has saved payout details (required to receive payments).
 // ============================================================
 router.post('/go-live', authenticate, authorize('provider'), async (req, res) => {
   try {
@@ -500,6 +659,20 @@ router.post('/go-live', authenticate, authorize('provider'), async (req, res) =>
         success: false,
         code: 'ALREADY_APPROVED',
         message: 'Your account is already verified. No resubmission is needed.',
+      });
+    }
+
+    // Payment details are required to receive payouts — block go-live without them.
+    const payRow = await db.queryAsUser(req.user.id,
+      `SELECT 1 FROM public.provider_payment_details
+        WHERE provider_id = $1 AND account_number_encrypted IS NOT NULL`,
+      [req.user.id]
+    );
+    if (payRow.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'PAYMENT_REQUIRED',
+        message: 'Please add your payment details before going live.',
       });
     }
 
